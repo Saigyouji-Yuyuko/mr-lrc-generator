@@ -1,14 +1,36 @@
 #include "gf256.h"
 #include "mr_lrc.h"
 
-#include <cerrno>
-#include <climits>
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
-#include <cstdlib>
+#include <ctime>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
+#include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
+
+#include <gflags/gflags.h>
+
+DEFINE_int32(data, 0, "Number of systematic data symbols.");
+DEFINE_int32(groups, 0, "Number of local groups; data is split nearly evenly.");
+DEFINE_int32(local_parity, 0, "Local parity symbols per group.");
+DEFINE_int32(global_parity, 0, "Global parity symbols.");
+DEFINE_uint64(seed, 0, "Random seed. If omitted, a seed is generated and printed.");
+DEFINE_string(local_method, "cauchy", "Local parity construction: cauchy, vandermonde, random.");
+DEFINE_string(global_method, "cauchy", "Global parity construction: cauchy, vandermonde, random.");
+DEFINE_string(method, "", "Alias that sets both local_method and global_method.");
+DEFINE_string(construction, "true",
+              "Enable registered data-local constructions: true/false, on/off, 1/0, yes/no.");
+DEFINE_uint64(random_limit, std::numeric_limits<uint64_t>::max(), "Maximum random candidate attempts.");
+DEFINE_uint64(thread_count, 1, "Parallel search worker count, max 256.");
+DEFINE_uint64(step_time, 30, "Print search progress every N seconds; 0 disables progress.");
+DEFINE_string(json, "", "Write the found matrix as pretty JSON to this file.");
 
 namespace {
 
@@ -17,48 +39,20 @@ public:
     explicit CliError(const std::string &message) : std::runtime_error(message) {}
 };
 
-void print_usage(std::ostream &out, const char *program)
+std::string usage_message()
 {
-    out << "Usage: " << program
-        << " --data K --groups G --local-parity R --global-parity M --seed S "
-           "[--construction BOOL] [--local-method METHOD --global-method METHOD] "
-           "[--random-limit N] [--thread-count N]\n\n"
-        << "Generate and exhaustively verify a GF(256) MR-LRC generator matrix.\n\n"
-        << "Required parameters:\n"
-        << "  -k, --data K             Number of systematic data symbols.\n"
-        << "  -g, --groups G           Number of local groups; data is split nearly evenly.\n"
-        << "  -r, --local-parity R     Local parity symbols per group.\n"
-        << "  -p, --global-parity M    Global parity symbols.\n"
-        << "  -s, --seed S             Random seed.\n"
-        << "      --local-method M     Local parity construction: cauchy, vandermonde, random.\n"
-        << "      --global-method M    Global parity construction: cauchy, vandermonde, random.\n"
-        << "      --construction BOOL  Enable registered data-local constructions: true/false, default true.\n"
-        << "      --random-limit N     Maximum random candidate attempts, default 1000.\n"
-        << "  -t, --thread-count N     Parallel search worker count, default 1, max 256.\n"
-        << "  -m, --method M           Alias: set both local and global methods.\n"
-        << "  -h, --help               Show this help.\n";
-}
-
-int parse_i32(const std::string &text)
-{
-    char *end = nullptr;
-    errno = 0;
-    long parsed = std::strtol(text.c_str(), &end, 10);
-    if (errno != 0 || end == text.c_str() || *end != '\0' || parsed < INT_MIN || parsed > INT_MAX) {
-        throw CliError("invalid integer: " + text);
-    }
-    return static_cast<int>(parsed);
-}
-
-uint64_t parse_u64(const std::string &text)
-{
-    char *end = nullptr;
-    errno = 0;
-    unsigned long long parsed = std::strtoull(text.c_str(), &end, 10);
-    if (errno != 0 || end == text.c_str() || *end != '\0') {
-        throw CliError("invalid unsigned integer: " + text);
-    }
-    return static_cast<uint64_t>(parsed);
+    return "Generate and exactly verify a GF(256) MR-LRC generator matrix.\n\n"
+           "Required parameters:\n"
+           "  -k, --data K\n"
+           "  -g, --groups G\n"
+           "  -r, --local-parity R\n"
+           "  -p, --global-parity M\n\n"
+           "Optional aliases are accepted for compatibility:\n"
+           "  -s, --seed S\n"
+           "  -t, --thread-count N\n"
+           "  -m, --method M\n"
+           "  --local-method M, --global-method M, --random-limit N\n"
+           "  --json FILE\n";
 }
 
 bool parse_bool(const std::string &text)
@@ -72,86 +66,166 @@ bool parse_bool(const std::string &text)
     throw CliError("invalid boolean: " + text);
 }
 
-const char *require_value(int argc, char **argv, int *i)
+bool flag_was_set(const char *name)
 {
-    if (*i + 1 >= argc) {
-        throw CliError(std::string("missing value for ") + argv[*i]);
+    gflags::CommandLineFlagInfo info;
+    return gflags::GetCommandLineFlagInfo(name, &info) && !info.is_default;
+}
+
+uint64_t splitmix64_value(uint64_t value)
+{
+    value += UINT64_C(0x9e3779b97f4a7c15);
+    value = (value ^ (value >> 30U)) * UINT64_C(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27U)) * UINT64_C(0x94d049bb133111eb);
+    return value ^ (value >> 31U);
+}
+
+uint64_t generate_seed()
+{
+    std::random_device random;
+    uint64_t value = (static_cast<uint64_t>(random()) << 32U) ^ static_cast<uint64_t>(random());
+    value ^= static_cast<uint64_t>(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    value ^= static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(&value));
+    return splitmix64_value(value);
+}
+
+std::string normalize_flag_name(const std::string &arg)
+{
+    static const std::vector<std::pair<std::string, std::string>> aliases = {
+        {"--local-parity", "--local_parity"},
+        {"--global-parity", "--global_parity"},
+        {"--local-method", "--local_method"},
+        {"--global-method", "--global_method"},
+        {"--random-limit", "--random_limit"},
+        {"--thread-count", "--thread_count"},
+        {"--step-time", "--step_time"},
+        {"--step-times", "--step_time"},
+        {"--matrix-json", "--json"},
+        {"-k", "--data"},
+        {"-g", "--groups"},
+        {"-r", "--local_parity"},
+        {"-p", "--global_parity"},
+        {"-s", "--seed"},
+        {"-t", "--thread_count"},
+        {"-m", "--method"},
+        {"-h", "--help"},
+        {"--family", "--method"},
+    };
+
+    for (const auto &alias : aliases) {
+        const auto &from = alias.first;
+        const auto &to = alias.second;
+        if (arg == from) {
+            return to;
+        }
+        if (arg.rfind(from + "=", 0) == 0) {
+            return to + arg.substr(from.size());
+        }
     }
-    (*i)++;
-    return argv[*i];
+
+    if (arg == "--noconstruction") {
+        return "--construction=false";
+    }
+    return arg;
+}
+
+std::vector<std::string> normalize_args(int argc, char **argv)
+{
+    std::vector<std::string> normalized;
+    normalized.reserve(static_cast<std::size_t>(argc));
+    for (int i = 0; i < argc; i++) {
+        normalized.push_back(normalize_flag_name(argv[i]));
+    }
+    return normalized;
 }
 
 struct CliOptions {
     mrlrc::Params params;
-    bool have_data = false;
-    bool have_groups = false;
-    bool have_local_parity = false;
-    bool have_global_parity = false;
-    bool have_seed = false;
-    bool have_local_method = false;
-    bool have_global_method = false;
+    std::string json_path;
 };
 
 CliOptions parse_args(int argc, char **argv)
 {
-    CliOptions opts;
-
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "-h" || arg == "--help") {
-            print_usage(std::cout, argv[0]);
-            std::exit(0);
-        } else if (arg == "-k" || arg == "--data") {
-            opts.params.data = parse_i32(require_value(argc, argv, &i));
-            opts.have_data = true;
-        } else if (arg == "-g" || arg == "--groups") {
-            opts.params.groups = parse_i32(require_value(argc, argv, &i));
-            opts.have_groups = true;
-        } else if (arg == "-r" || arg == "--local-parity") {
-            opts.params.local_parity = parse_i32(require_value(argc, argv, &i));
-            opts.have_local_parity = true;
-        } else if (arg == "-p" || arg == "--global-parity") {
-            opts.params.global_parity = parse_i32(require_value(argc, argv, &i));
-            opts.have_global_parity = true;
-        } else if (arg == "-s" || arg == "--seed") {
-            opts.params.seed = parse_u64(require_value(argc, argv, &i));
-            opts.have_seed = true;
-        } else if (arg == "--random-limit") {
-            opts.params.random_limit = parse_u64(require_value(argc, argv, &i));
-        } else if (arg == "-t" || arg == "--thread-count") {
-            opts.params.thread_count = parse_u64(require_value(argc, argv, &i));
-        } else if (arg == "--local-method") {
-            std::string method = require_value(argc, argv, &i);
-            if (!mrlrc::parse_family(method, &opts.params.local_family)) {
-                throw CliError("invalid local method: " + method);
-            }
-            opts.have_local_method = true;
-        } else if (arg == "--global-method") {
-            std::string method = require_value(argc, argv, &i);
-            if (!mrlrc::parse_family(method, &opts.params.global_family)) {
-                throw CliError("invalid global method: " + method);
-            }
-            opts.have_global_method = true;
-        } else if (arg == "--construction") {
-            opts.params.construction = parse_bool(require_value(argc, argv, &i));
-        } else if (arg == "-m" || arg == "--method" || arg == "--family") {
-            std::string method = require_value(argc, argv, &i);
-            mrlrc::MatrixFamily parsed;
-            if (!mrlrc::parse_family(method, &parsed)) {
-                throw CliError("invalid method: " + method);
-            }
-            opts.params.local_family = parsed;
-            opts.params.global_family = parsed;
-            opts.have_local_method = true;
-            opts.have_global_method = true;
-        } else {
-            throw CliError("unknown argument: " + arg);
-        }
+    std::vector<std::string> normalized = normalize_args(argc, argv);
+    std::vector<char *> normalized_argv;
+    normalized_argv.reserve(normalized.size());
+    for (auto &arg : normalized) {
+        normalized_argv.push_back(arg.data());
     }
 
-    if (!opts.have_data || !opts.have_groups || !opts.have_local_parity ||
-        !opts.have_global_parity || !opts.have_seed) {
-        throw CliError("missing required parameter; run with --help for usage");
+    int normalized_argc = static_cast<int>(normalized_argv.size());
+    char **normalized_argv_data = normalized_argv.data();
+    gflags::SetUsageMessage(usage_message());
+    gflags::ParseCommandLineFlags(&normalized_argc, &normalized_argv_data, true);
+
+    if (normalized_argc > 1) {
+        throw CliError(std::string("unexpected positional argument: ") + normalized_argv_data[1]);
+    }
+
+    std::vector<std::string> missing;
+    if (!flag_was_set("data")) {
+        missing.push_back("--data");
+    }
+    if (!flag_was_set("groups")) {
+        missing.push_back("--groups");
+    }
+    if (!flag_was_set("local_parity")) {
+        missing.push_back("--local-parity");
+    }
+    if (!flag_was_set("global_parity")) {
+        missing.push_back("--global-parity");
+    }
+    if (!missing.empty()) {
+        std::string message = "missing required parameter(s): ";
+        for (std::size_t i = 0; i < missing.size(); i++) {
+            if (i != 0) {
+                message += ", ";
+            }
+            message += missing[i];
+        }
+        message += "; run with --help for usage";
+        throw CliError(message);
+    }
+
+    CliOptions opts;
+    opts.params.data = FLAGS_data;
+    opts.params.groups = FLAGS_groups;
+    opts.params.local_parity = FLAGS_local_parity;
+    opts.params.global_parity = FLAGS_global_parity;
+    opts.params.seed = flag_was_set("seed") ? FLAGS_seed : generate_seed();
+    opts.params.random_limit = FLAGS_random_limit;
+    opts.params.thread_count = FLAGS_thread_count;
+    opts.params.construction = parse_bool(FLAGS_construction);
+    opts.params.step_time = FLAGS_step_time;
+    if (opts.params.step_time != 0) {
+        opts.params.progress_callback = [](uint64_t completed) {
+            std::time_t now = std::time(nullptr);
+            std::tm local_time{};
+            localtime_r(&now, &local_time);
+            std::cerr << std::put_time(&local_time, "%F %T")
+                      << " has search " << completed << " count\n";
+        };
+    }
+    opts.json_path = FLAGS_json;
+
+    if (!FLAGS_method.empty()) {
+        mrlrc::MatrixFamily parsed;
+        if (!mrlrc::parse_family(FLAGS_method, &parsed)) {
+            throw CliError("invalid method: " + FLAGS_method);
+        }
+        opts.params.local_family = parsed;
+        opts.params.global_family = parsed;
+    }
+    if (FLAGS_method.empty() || flag_was_set("local_method")) {
+        if (!mrlrc::parse_family(FLAGS_local_method, &opts.params.local_family)) {
+            throw CliError("invalid local method: " + FLAGS_local_method);
+        }
+    }
+    if (FLAGS_method.empty() || flag_was_set("global_method")) {
+        if (!mrlrc::parse_family(FLAGS_global_method, &opts.params.global_family)) {
+            throw CliError("invalid global method: " + FLAGS_global_method);
+        }
     }
     return opts;
 }
@@ -188,6 +262,46 @@ void print_matrix(const mrlrc::Code &code)
     }
 }
 
+void print_matrix_json(std::ostream &out, const mrlrc::Code &code, int local_parity)
+{
+    out << "{\n";
+    out << "  \"data_cnt\": " << code.data << ",\n";
+    out << "  \"group_cnt\": " << code.groups.size() << ",\n";
+    out << "  \"local_parity_cnt\": " << local_parity << ",\n";
+    out << "  \"global_parity_cnt\": " << code.global_parity << ",\n";
+    out << "  \"matrix\": [\n";
+    for (int row = 0; row < code.symbols; row++) {
+        out << "    [";
+        for (int col = 0; col < code.data; col++) {
+            if (col != 0) {
+                out << ", ";
+            }
+            auto pos = static_cast<std::size_t>(row) * static_cast<std::size_t>(code.data) +
+                       static_cast<std::size_t>(col);
+            out << static_cast<unsigned>(code.matrix[pos]);
+        }
+        out << "]";
+        if (row + 1 != code.symbols) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << "  ]\n";
+    out << "}\n";
+}
+
+void write_matrix_json_file(const std::string &path, const mrlrc::Code &code, int local_parity)
+{
+    std::ofstream out(path);
+    if (!out) {
+        throw CliError("could not open JSON output file: " + path);
+    }
+    print_matrix_json(out, code, local_parity);
+    if (!out) {
+        throw CliError("could not write JSON output file: " + path);
+    }
+}
+
 void print_failed_pattern(const mrlrc::Code &code, const std::vector<int> &erased)
 {
     if (erased.empty()) {
@@ -201,6 +315,12 @@ void print_failed_pattern(const mrlrc::Code &code, const std::vector<int> &erase
     std::cout << "\n";
 }
 
+template <typename T>
+void print_attribute(const char *name, const T &value)
+{
+    std::cout << name << "=" << value << "\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -212,37 +332,45 @@ int main(int argc, char **argv)
 
         if (result.status != 0) {
             std::cout << "MR-LRC matrix not found\n";
-            std::cout << "message=" << result.message << "\n";
+            print_attribute("message", result.message);
             if (!code.matrix.empty()) {
-                std::cout << "patterns_checked=" << result.check.patterns_checked
-                          << " failures=" << result.check.failures << "\n";
+                print_attribute("patterns_checked", result.check.patterns_checked);
+                print_attribute("failures", result.check.failures);
                 print_failed_pattern(code, result.check.first_failed_erased);
             }
+            gflags::ShutDownCommandLineFlags();
             return result.status == 2 ? 2 : 1;
         }
 
+        if (!opts.json_path.empty()) {
+            write_matrix_json_file(opts.json_path, code, opts.params.local_parity);
+        }
+
         std::cout << "MR-LRC matrix found\n";
-        std::cout << "data=" << code.data << " groups=" << code.groups.size()
-                  << " local_parity=" << opts.params.local_parity
-                  << " local_rows=" << code.local_rows
-                  << " global_parity=" << code.global_parity
-                  << " total_parity=" << code.total_parity
-                  << " symbols=" << code.symbols << "\n";
-        std::cout << "construction=" << (code.construction ? "on" : "off")
-                  << " candidate_source=" << code.candidate_source
-                  << " local_method=" << mrlrc::family_name(code.local_family)
-                  << " global_method=" << mrlrc::family_name(code.global_family)
-                  << " seed=" << code.seed
-                  << " random_limit=" << opts.params.random_limit
-                  << " thread_count=" << opts.params.thread_count
-                  << " attempt=" << code.attempt
-                  << " patterns_checked=" << result.check.patterns_checked
-                  << " gf256_backend=" << mrlrc::gf256_backend() << "\n";
+        print_attribute("data", code.data);
+        print_attribute("groups", code.groups.size());
+        print_attribute("local_parity", opts.params.local_parity);
+        print_attribute("local_rows", code.local_rows);
+        print_attribute("global_parity", code.global_parity);
+        print_attribute("total_parity", code.total_parity);
+        print_attribute("symbols", code.symbols);
+        print_attribute("construction", code.construction ? "on" : "off");
+        print_attribute("candidate_source", code.candidate_source);
+        print_attribute("local_method", mrlrc::family_name(code.local_family));
+        print_attribute("global_method", mrlrc::family_name(code.global_family));
+        print_attribute("seed", code.seed);
+        print_attribute("random_limit", opts.params.random_limit);
+        print_attribute("thread_count", opts.params.thread_count);
+        print_attribute("attempt", code.attempt);
+        print_attribute("patterns_checked", result.check.patterns_checked);
+        print_attribute("gf256_backend", mrlrc::gf256_backend());
         print_layout(code);
         print_matrix(code);
+        gflags::ShutDownCommandLineFlags();
         return 0;
     } catch (const std::exception &ex) {
         std::cerr << "error: " << ex.what() << "\n";
+        gflags::ShutDownCommandLineFlags();
         return 1;
     }
 }

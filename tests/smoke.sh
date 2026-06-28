@@ -3,7 +3,8 @@ set -euo pipefail
 
 build_dir="${1:-build}"
 log_file="$(mktemp)"
-trap 'rm -f "$log_file"' EXIT
+json_file="$(mktemp)"
+trap 'rm -f "$log_file" "$json_file"' EXIT
 
 cmake -S . -B "$build_dir"
 cmake --build "$build_dir"
@@ -23,6 +24,8 @@ run_case() {
 }
 
 run_case "small_cauchy" -k 4 -g 2 -r 1 -p 1 -s 7 --construction false -m cauchy
+run_case "seed_optional" -k 4 -g 2 -r 1 -p 1 --construction false -m cauchy --random-limit 1
+run_case "json_output" -k 4 -g 2 -r 1 -p 1 -s 7 --construction false -m cauchy --json "$json_file"
 run_case "three_group_cauchy" -k 6 -g 3 -r 1 -p 2 -s 123 --construction false --local-method cauchy --global-method cauchy
 run_case "small_vandermonde" -k 4 -g 2 -r 1 -p 1 -s 7 --construction false --local-method vandermonde --global-method vandermonde
 run_case "local_a2_random_global" -k 6 -g 2 -r 2 -p 1 -s 99 --construction false --local-method cauchy --global-method random

@@ -2,9 +2,10 @@
 #define MR_LRC_GENERATOR_H
 
 #include <cstdint>
+#include <functional>
+#include <limits>
 #include <string>
 #include <vector>
-#include <limits>
 
 namespace mrlrc {
 
@@ -19,12 +20,14 @@ struct Params {
     int groups = 0;
     int local_parity = 0;
     int global_parity = 0;
-    uint64_t seed = rand();
+    uint64_t seed = 0;
     uint64_t random_limit = std::numeric_limits<uint64_t>::max();
     uint64_t thread_count = 1;
     MatrixFamily local_family = MatrixFamily::Cauchy;
     MatrixFamily global_family = MatrixFamily::Cauchy;
     bool construction = true;
+    uint64_t step_time = 0;
+    std::function<void(uint64_t)> progress_callback;
 };
 
 struct LocalGroup {
@@ -39,7 +42,7 @@ struct Code {
     int global_parity = 0;
     int local_rows = 0;
     int symbols = 0;
-    uint64_t seed = rand();
+    uint64_t seed = 0;
     uint64_t attempt = 0;
     uint64_t patterns_checked = 0;
     MatrixFamily local_family = MatrixFamily::Cauchy;

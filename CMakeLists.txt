@@ -8,6 +8,21 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(MR_LRC_REQUIRE_ISAL "Fail configure when ISA-L is not found" OFF)
 find_package(Threads REQUIRED)
+find_package(gflags CONFIG QUIET)
+
+if(NOT gflags_FOUND)
+    include(FetchContent)
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.10 CACHE STRING "" FORCE)
+    set(GFLAGS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(GFLAGS_BUILD_gflags_LIB ON CACHE BOOL "" FORCE)
+    set(GFLAGS_BUILD_gflags_nothreads_LIB OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        gflags
+        GIT_REPOSITORY https://github.com/gflags/gflags.git
+        GIT_TAG v2.2.2
+    )
+    FetchContent_MakeAvailable(gflags)
+endif()
 
 set(ISAL_LOCAL_PREFIX "${CMAKE_CURRENT_LIST_DIR}/third_party/isa-l/install/usr")
 if(ISAL_INCLUDE_DIR AND NOT EXISTS "${ISAL_INCLUDE_DIR}/erasure_code.h")
@@ -40,6 +55,16 @@ add_executable(mr-lrc-generator
 
 target_include_directories(mr-lrc-generator PRIVATE src)
 target_link_libraries(mr-lrc-generator PRIVATE Threads::Threads)
+
+if(TARGET gflags::gflags)
+    target_link_libraries(mr-lrc-generator PRIVATE gflags::gflags)
+elseif(TARGET gflags)
+    target_link_libraries(mr-lrc-generator PRIVATE gflags)
+elseif(TARGET gflags_static)
+    target_link_libraries(mr-lrc-generator PRIVATE gflags_static)
+else()
+    message(FATAL_ERROR "gflags target was not found after configuring gflags")
+endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(mr-lrc-generator PRIVATE -Wall -Wextra -Wpedantic)
