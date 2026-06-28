@@ -151,9 +151,11 @@ budget globally. The checker first verifies the local MDS cases, eliminates each
 local group to its residual subspace, deduplicates equivalent residual column
 spaces, and then checks the resulting small GF(256) matrices together with any
 erased global parity columns. For `global_parity = 2`, the residual stage uses a
-projective-line fast path. For `global_parity = 3` or `4`, it builds an exact
-dual index from residual-block annihilator subspaces and runs a small DP over
-the indexed group options. A candidate that passes this residual check is then
+projective-line fast path. For `global_parity = 3`, it streams projective dual
+directions from residual-block annihilator subspaces and stops as soon as a
+failure witness is found. For `global_parity = 4`, it runs the same streaming
+check up to a small unique-dual threshold, then falls back to an exact dual index
+if no early failure is found. A candidate that passes this residual check is then
 validated by the original full erasure-pattern enumeration before it is reported
 as MR.
 

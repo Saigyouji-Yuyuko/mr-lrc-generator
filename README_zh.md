@@ -139,9 +139,11 @@ total_parity = groups * local_parity + global_parity
 情形，把每个 local group 消元到 residual subspace，对等价的 residual column
 space 去重，然后把得到的小 GF(256) 矩阵和被擦除的 global parity column 一起检查。
 当 `global_parity = 2` 时，residual 阶段使用 projective-line fast path。当
-`global_parity = 3` 或 `4` 时，会从 residual block 的 annihilator subspace 构建
-精确 dual index，并在索引出的 group option 上做小 DP。通过 residual 检查的候选，
-还必须通过原始完整 erasure-pattern 枚举后才会被报告为 MR。
+`global_parity = 3` 时，会从 residual block 的 annihilator subspace 流式产生
+projective dual direction，并在找到失败 witness 时立即停止。当 `global_parity = 4`
+时，会先流式检查一小批 unique dual direction；若没有提前失败，再回退到精确
+dual index。通过 residual 检查的候选，还必须通过原始完整 erasure-pattern 枚举后
+才会被报告为 MR。
 
 `--random-limit` 限制候选矩阵的总尝试次数。`--thread-count` 只控制从同一尝试预算
 中领取任务的 worker 数，不会放大总尝试次数。多线程时，第一个完成并通过校验的

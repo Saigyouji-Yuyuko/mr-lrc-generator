@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -22,6 +23,7 @@ namespace mrlrc {
 namespace {
 
 constexpr uint64_t kMaxThreadCount = 256;
+constexpr uint64_t kH4StreamingDualLimit = 8192;
 
 class ValidationError : public std::runtime_error {
 public:
@@ -540,7 +542,9 @@ public:
         if (!should_stop()) {
             if (h_ == 2) {
                 verify_h2_fast_path();
-            } else if (h_ == 3 || h_ == 4) {
+            } else if (h_ == 3) {
+                verify_by_streaming_dual(0);
+            } else if (h_ == 4 && !verify_by_streaming_dual(kH4StreamingDualLimit)) {
                 verify_by_dual_index();
             } else {
                 std::vector<uint8_t> empty;
@@ -859,6 +863,21 @@ private:
         return support;
     }
 
+    bool annihilates(const std::vector<uint8_t> &y, const ResidualBlock &block) const
+    {
+        for (int col = 0; col < block.extra; col++) {
+            uint8_t value = 0;
+            for (int row = 0; row < h_; row++) {
+                value ^= gf256_mul(y[static_cast<std::size_t>(row)],
+                                   block.matrix[idx(row, col, block.extra)]);
+            }
+            if (value != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     std::vector<int> kept_rows_for_dual_failure(const std::vector<uint8_t> &y, int used) const
     {
         std::vector<int> kept;
@@ -1017,6 +1036,115 @@ private:
         return y;
     }
 
+    std::vector<DualGroupOptions> dual_options_for_vector(const std::vector<uint8_t> &y) const
+    {
+        std::vector<DualGroupOptions> options(code_.groups.size());
+        for (auto &group_options : options) {
+            group_options.by_extra.assign(static_cast<std::size_t>(h_ + 1), nullptr);
+        }
+
+        for (int group_index = 0; group_index < static_cast<int>(residual_blocks_.size()); group_index++) {
+            const auto &group_blocks = residual_blocks_[static_cast<std::size_t>(group_index)];
+            for (int extra = 1; extra < static_cast<int>(group_blocks.by_extra.size()) && extra <= h_;
+                 extra++) {
+                auto &slot = options[static_cast<std::size_t>(group_index)]
+                                 .by_extra[static_cast<std::size_t>(extra)];
+                if (slot != nullptr) {
+                    continue;
+                }
+                for (const auto &block : group_blocks.by_extra[static_cast<std::size_t>(extra)]) {
+                    if (annihilates(y, block)) {
+                        slot = &block;
+                        break;
+                    }
+                }
+            }
+        }
+
+        return options;
+    }
+
+    bool check_streaming_dual_from_coefficients(const std::vector<uint8_t> &basis, int dim,
+                                                const std::vector<uint8_t> &coefficients)
+    {
+        std::vector<uint8_t> y = dual_from_coefficients(basis, dim, coefficients);
+        std::string key = canonical_dual_key(y);
+        if (key.empty()) {
+            return true;
+        }
+        if (checked_streaming_dual_vectors_.find(key) != checked_streaming_dual_vectors_.end()) {
+            return true;
+        }
+        if (streaming_dual_limit_ != 0 &&
+            checked_streaming_dual_vectors_.size() >= streaming_dual_limit_) {
+            streaming_dual_limit_hit_ = true;
+            return false;
+        }
+
+        checked_streaming_dual_vectors_.insert(key);
+        return check_dual_options(y, dual_options_for_vector(y));
+    }
+
+    bool enumerate_streaming_annihilator_suffix(const std::vector<uint8_t> &basis, int dim, int pos,
+                                                std::vector<uint8_t> *coefficients)
+    {
+        if (should_stop() || streaming_dual_limit_hit_) {
+            return false;
+        }
+        if (pos == dim) {
+            return check_streaming_dual_from_coefficients(basis, dim, *coefficients);
+        }
+
+        for (int value = 0; value < 256; value++) {
+            (*coefficients)[static_cast<std::size_t>(pos)] = static_cast<uint8_t>(value);
+            if (!enumerate_streaming_annihilator_suffix(basis, dim, pos + 1, coefficients)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool stream_annihilator_projective_vectors(const ResidualBlock &block)
+    {
+        std::vector<uint8_t> basis = left_nullspace_basis(block);
+        int dim = h_ == 0 ? 0 : static_cast<int>(basis.size()) / h_;
+        if (dim == 0) {
+            return true;
+        }
+
+        std::vector<uint8_t> coefficients(static_cast<std::size_t>(dim), 0);
+        for (int pivot = 0; pivot < dim; pivot++) {
+            std::fill(coefficients.begin(), coefficients.end(), 0);
+            coefficients[static_cast<std::size_t>(pivot)] = 1;
+            if (!enumerate_streaming_annihilator_suffix(basis, dim, pivot + 1, &coefficients)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool verify_by_streaming_dual(uint64_t limit)
+    {
+        streaming_dual_limit_ = limit;
+        streaming_dual_limit_hit_ = false;
+        checked_streaming_dual_vectors_.clear();
+
+        for (int extra = h_; extra >= 1; extra--) {
+            for (const auto &group_blocks : residual_blocks_) {
+                if (extra >= static_cast<int>(group_blocks.by_extra.size())) {
+                    continue;
+                }
+                for (const auto &block : group_blocks.by_extra[static_cast<std::size_t>(extra)]) {
+                    if (!stream_annihilator_projective_vectors(block)) {
+                        return should_stop() || !streaming_dual_limit_hit_;
+                    }
+                }
+            }
+        }
+
+        return true;
+    }
+
     void add_dual_index_option(int group_index, const ResidualBlock &block, const std::vector<uint8_t> &basis,
                                int dim, const std::vector<uint8_t> &coefficients)
     {
@@ -1105,6 +1233,9 @@ private:
         }
 
         for (const auto &entry : dual_index_) {
+            if (checked_streaming_dual_vectors_.find(entry.first) != checked_streaming_dual_vectors_.end()) {
+                continue;
+            }
             std::vector<uint8_t> y = dual_vector_from_key(entry.first);
             if (!check_dual_options(y, entry.second)) {
                 return false;
@@ -1166,6 +1297,9 @@ private:
     std::vector<std::vector<int>> group_erased_;
     std::set<std::string> verified_states_;
     std::unordered_map<std::string, std::vector<DualGroupOptions>> dual_index_;
+    std::unordered_set<std::string> checked_streaming_dual_vectors_;
+    uint64_t streaming_dual_limit_ = 0;
+    bool streaming_dual_limit_hit_ = false;
     int h_ = 0;
 };
 
