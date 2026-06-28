@@ -17,10 +17,8 @@ The tool builds a systematic generator matrix:
 Data symbols are split as evenly as possible across local groups. Local parity
 rows only cover data symbols in their own group, while global parity rows cover
 the full stripe. Candidate matrices are generated with independent local and
-global construction methods, then an exact residual-space checker verifies the
-same maximum erasure cases without materializing every full `k x k` decoding
-matrix for each residual branch. Before a passing candidate is accepted, the
-original full maximal-erasure checker is still run as a final gate.
+global construction methods, then the checker enumerates maximum erasure cases
+and verifies recoverability over GF(256).
 
 ## Features
 
@@ -28,7 +26,7 @@ original full maximal-erasure checker is still run as a final gate.
 - Independent local and global construction methods. Local rows support
   `cauchy`, `vandermonde`, or `random`; global rows also support
   `column_multiplier_cauchy`.
-- Exact residual MR check over all maximum erasure cases.
+- Exact MR check over all maximum erasure cases.
 - Optional `--seed` for deterministic random search; omitted seeds are
   generated and printed.
 - Search bound via `--random-limit`.
@@ -154,10 +152,11 @@ and column-scaled Cauchy global parity rows.
 
 ## Scale Notes
 
-For `data_cnt > 12`, using `global_parity >= 3` is not recommended. Wide LRC
-layouts are not supported, and `data_cnt >= 20` has not been tested.
+- For `data_cnt > 12`, using `global_parity >= 3` is not recommended.
+- Wide LRC layouts are not supported.
+- `data_cnt >= 20` has not been tested.
 
-## Search Model
+## Verification Model
 
 The total parity count is computed as:
 
@@ -167,20 +166,8 @@ total_parity = groups * local_parity + global_parity
 
 A maximum erasure pattern has size `total_parity` and must erase at least
 `local_parity` symbols in every local group, then spend the remaining erasure
-budget globally. The checker first verifies the local MDS cases, eliminates each
-local group to its residual subspace, deduplicates equivalent residual column
-spaces, and then checks the resulting small GF(256) matrices together with any
-erased global parity columns. For `global_parity = 2`, the residual stage uses a
-projective-line fast path. For `global_parity = 3`, it streams projective dual
-directions from residual-block annihilator subspaces and stops as soon as a
-failure witness is found. For `global_parity = 4`, it runs the same streaming
-check up to a small unique-dual threshold, then falls back to an exact dual index
-if no early failure is found. Two-local-group layouts use a direct projection
-fast path over kept global rows, and single-local-parity groups build residual
-blocks with a closed-form column-difference formula instead of Gaussian
-nullspace elimination. A candidate that passes this residual check is then
-validated by the original full erasure-pattern enumeration before it is reported
-as MR.
+budget globally. The checker enumerates these maximum erasure patterns and
+accepts a candidate only when every enumerated case is recoverable.
 
 `--random-limit` bounds the total number of candidate matrices. `--thread-count`
 only controls how many workers draw from that shared attempt budget; it does not
@@ -207,9 +194,8 @@ Representative smoke-test cases:
 | `mr_2_6_2_2` | `(g,r,a,h) = (2,6,2,2)` | `--data 6 --groups 2 --local-parity 2 --global-parity 2` |
 | `mr_3_6_2_2` | `(g,r,a,h) = (3,6,2,2)` | `--data 10 --groups 3 --local-parity 2 --global-parity 2` |
 
-Larger codes may require a higher `--random-limit`; exact residual verification
-is much cheaper than full erasure-pattern inversion, but the residual search can
-still grow with larger `global_parity` values.
+Larger codes may require a higher `--random-limit`; the number of enumerated
+checks can still grow quickly with larger `global_parity` values.
 
 ## Test
 
