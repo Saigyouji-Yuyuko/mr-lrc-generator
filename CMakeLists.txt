@@ -6,9 +6,16 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+    message(STATUS "No CMAKE_BUILD_TYPE set; defaulting to Release")
+endif()
+
 option(MR_LRC_REQUIRE_ISAL "Fail configure when ISA-L is not found" OFF)
 find_package(Threads REQUIRED)
 find_package(gflags CONFIG QUIET)
+find_package(unordered_dense CONFIG QUIET)
 
 if(NOT gflags_FOUND)
     include(FetchContent)
@@ -22,6 +29,16 @@ if(NOT gflags_FOUND)
         GIT_TAG v2.2.2
     )
     FetchContent_MakeAvailable(gflags)
+endif()
+
+if(NOT unordered_dense_FOUND)
+    include(FetchContent)
+    FetchContent_Declare(
+        unordered_dense
+        GIT_REPOSITORY https://github.com/martinus/unordered_dense.git
+        GIT_TAG v4.8.1
+    )
+    FetchContent_MakeAvailable(unordered_dense)
 endif()
 
 set(ISAL_LOCAL_PREFIX "${CMAKE_CURRENT_LIST_DIR}/third_party/isa-l/install/usr")
@@ -64,6 +81,16 @@ elseif(TARGET gflags_static)
     target_link_libraries(mr-lrc-generator PRIVATE gflags_static)
 else()
     message(FATAL_ERROR "gflags target was not found after configuring gflags")
+endif()
+
+if(TARGET unordered_dense::unordered_dense)
+    target_link_libraries(mr-lrc-generator PRIVATE unordered_dense::unordered_dense)
+elseif(TARGET unordered_dense)
+    target_link_libraries(mr-lrc-generator PRIVATE unordered_dense)
+elseif(DEFINED unordered_dense_SOURCE_DIR AND EXISTS "${unordered_dense_SOURCE_DIR}/include")
+    target_include_directories(mr-lrc-generator PRIVATE "${unordered_dense_SOURCE_DIR}/include")
+else()
+    message(FATAL_ERROR "unordered_dense target/include directory was not found after configuring unordered_dense")
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

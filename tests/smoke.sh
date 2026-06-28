@@ -23,10 +23,26 @@ run_case() {
     return 1
 }
 
+run_fail_case() {
+    local name="$1"
+    shift
+
+    if "$build_dir/mr-lrc-generator" "$@" >"$log_file" 2>&1; then
+        printf 'not ok %s\n' "$name" >&2
+        sed -n '1,120p' "$log_file" >&2
+        return 1
+    fi
+
+    printf 'ok %s\n' "$name"
+}
+
 run_case "small_cauchy" -k 4 -g 2 -r 1 -p 1 -s 7 --construction false -m cauchy
 run_case "seed_optional" -k 4 -g 2 -r 1 -p 1 --construction false -m cauchy --random-limit 1
 run_case "json_output" -k 4 -g 2 -r 1 -p 1 -s 7 --construction false -m cauchy --json "$json_file"
+run_case "cauchy_dedup" -k 4 -g 2 -r 1 -p 1 -s 7 --construction false -m cauchy --cauchy-dedup
 run_case "three_group_cauchy" -k 6 -g 3 -r 1 -p 2 -s 123 --construction false --local-method cauchy --global-method cauchy
+run_case "global_column_multiplier_cauchy" -k 6 -g 2 -r 1 -p 2 -s 17 --construction false --local-method cauchy --global-method column_multiplier_cauchy
+run_fail_case "local_column_multiplier_cauchy_rejected" -k 4 -g 2 -r 1 -p 1 -s 7 --construction false --local-method column_multiplier_cauchy --global-method cauchy
 run_case "small_vandermonde" -k 4 -g 2 -r 1 -p 1 -s 7 --construction false --local-method vandermonde --global-method vandermonde
 run_case "local_a2_random_global" -k 6 -g 2 -r 2 -p 1 -s 99 --construction false --local-method cauchy --global-method random
 run_case "random_random_limit" -k 6 -g 2 -r 1 -p 2 -s 1 --construction false --local-method random --global-method random --random-limit 10

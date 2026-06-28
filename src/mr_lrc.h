@@ -11,6 +11,7 @@ namespace mrlrc {
 
 enum class MatrixFamily {
     Cauchy,
+    ColumnMultiplierCauchy,
     Vandermonde,
     Random,
 };
@@ -26,6 +27,7 @@ struct Params {
     MatrixFamily local_family = MatrixFamily::Cauchy;
     MatrixFamily global_family = MatrixFamily::Cauchy;
     bool construction = true;
+    bool cauchy_dedup = false;
     uint64_t step_time = 0;
     std::function<void(uint64_t)> progress_callback;
 };
@@ -67,6 +69,10 @@ struct GenerateResult {
     Code code;
     CheckResult check;
     uint64_t attempts_done = 0;
+    uint64_t unique_candidates_checked = 0;
+    uint64_t duplicate_candidates_skipped = 0;
+    uint64_t cauchy_dedup_key_bytes = 0;
+    bool cauchy_dedup_enabled = false;
 };
 
 const char *family_name(MatrixFamily family);

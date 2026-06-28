@@ -8,3 +8,5 @@ third_party/
 *.dylib
 *.dll
 mr-lrc-generator
+.worktree
+perf*

@@ -3,12 +3,15 @@
 #include "gf256.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <cstring>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -18,6 +21,8 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include <ankerl/unordered_dense.h>
 
 namespace mrlrc {
 namespace {
@@ -100,7 +105,131 @@ void shuffle(Rng &rng, std::vector<T> *items)
     }
 }
 
-std::vector<uint8_t> cauchy_matrix(int rows, int cols, Rng &rng)
+struct CauchyKeyBytes {
+    std::array<uint8_t, 256> bytes{};
+    std::size_t size = 0;
+
+    void clear() { size = 0; }
+
+    void append(const uint8_t *data, std::size_t count)
+    {
+        if (count > bytes.size() - size) {
+            throw ValidationError("cauchy dedup key exceeds 256 bytes; use --no-cauchy-dedup");
+        }
+        std::memcpy(bytes.data() + size, data, count);
+        size += count;
+    }
+};
+
+template <std::size_t Bytes>
+struct Key {
+    std::array<uint8_t, Bytes> bytes{};
+    uint16_t size = 0;
+
+    explicit Key(const CauchyKeyBytes &key)
+    {
+        if (key.size > Bytes) {
+            throw ValidationError("cauchy dedup key does not fit selected fixed key size");
+        }
+        size = static_cast<uint16_t>(key.size);
+        std::memcpy(bytes.data(), key.bytes.data(), key.size);
+    }
+
+    bool operator==(const Key &other) const
+    {
+        return size == other.size &&
+               std::memcmp(bytes.data(), other.bytes.data(), size) == 0;
+    }
+};
+
+template <std::size_t Bytes>
+struct KeyHash {
+    using is_avalanching = void;
+
+    uint64_t operator()(const Key<Bytes> &key) const
+    {
+        uint64_t h = UINT64_C(0x8ddca3a1f0f23a6d) ^ key.size;
+        for (std::size_t i = 0; i < key.size; i++) {
+            h = splitmix64_value(h ^ key.bytes[i]);
+        }
+        return h;
+    }
+};
+
+class CauchyDeduper {
+public:
+    virtual ~CauchyDeduper() = default;
+    virtual bool insert(const CauchyKeyBytes &key) = 0;
+};
+
+template <std::size_t Bytes>
+class DenseCauchyDeduper final : public CauchyDeduper {
+public:
+    bool insert(const CauchyKeyBytes &key) override
+    {
+        return keys_.insert(Key<Bytes>(key)).second;
+    }
+
+private:
+    ankerl::unordered_dense::set<Key<Bytes>, KeyHash<Bytes>> keys_;
+};
+
+std::unique_ptr<CauchyDeduper> make_cauchy_deduper(uint64_t key_bytes)
+{
+    if (key_bytes <= 32) {
+        return std::make_unique<DenseCauchyDeduper<32>>();
+    }
+    if (key_bytes <= 64) {
+        return std::make_unique<DenseCauchyDeduper<64>>();
+    }
+    if (key_bytes <= 128) {
+        return std::make_unique<DenseCauchyDeduper<128>>();
+    }
+    if (key_bytes <= 256) {
+        return std::make_unique<DenseCauchyDeduper<256>>();
+    }
+    throw ValidationError("cauchy dedup key exceeds 256 bytes; use --no-cauchy-dedup");
+}
+
+void append_cauchy_canonical_key(const std::vector<uint8_t> &pool, int rows, int cols, CauchyKeyBytes *key)
+{
+    if (key == nullptr || rows == 0 || cols == 0) {
+        return;
+    }
+
+    auto block_size = static_cast<std::size_t>(rows + cols);
+    std::vector<uint8_t> best(block_size, 0);
+    std::vector<uint8_t> candidate(block_size, 0);
+    std::vector<uint8_t> normalized_rows(static_cast<std::size_t>(rows), 0);
+    bool have_best = false;
+
+    for (int shift = 0; shift < 256; shift++) {
+        uint8_t t = static_cast<uint8_t>(shift);
+        for (int row = 0; row < rows; row++) {
+            normalized_rows[static_cast<std::size_t>(row)] = static_cast<uint8_t>(
+                pool[static_cast<std::size_t>(row)] ^ t);
+        }
+        std::sort(normalized_rows.begin(), normalized_rows.end());
+
+        std::copy(normalized_rows.begin(), normalized_rows.end(), candidate.begin());
+        for (int col = 0; col < cols; col++) {
+            candidate[static_cast<std::size_t>(rows + col)] = static_cast<uint8_t>(
+                pool[static_cast<std::size_t>(rows + col)] ^ t);
+        }
+
+        if (!have_best ||
+            std::lexicographical_compare(candidate.begin(), candidate.begin() + block_size,
+                                         best.begin(), best.begin() + block_size)) {
+            std::copy(candidate.begin(), candidate.end(), best.begin());
+            have_best = true;
+        }
+    }
+
+    // The first normalized row parameter is always zero in the canonical form.
+    key->append(best.data() + 1, block_size - 1);
+}
+
+std::vector<uint8_t> cauchy_matrix(int rows, int cols, Rng &rng, CauchyKeyBytes *canonical_key)
 {
     if (rows < 0 || cols < 0 || rows + cols > 256) {
         throw ValidationError("cauchy matrix requires rows + cols <= 256 over GF(256)");
@@ -116,12 +245,35 @@ std::vector<uint8_t> cauchy_matrix(int rows, int cols, Rng &rng)
         pool[static_cast<std::size_t>(i)] = static_cast<uint8_t>(i);
     }
     shuffle(rng, &pool);
+    append_cauchy_canonical_key(pool, rows, cols, canonical_key);
 
     for (int row = 0; row < rows; row++) {
         for (int col = 0; col < cols; col++) {
             matrix[idx(row, col, cols)] =
                 gf256_inv(static_cast<uint8_t>(pool[static_cast<std::size_t>(row)] ^
                                                pool[static_cast<std::size_t>(rows + col)]));
+        }
+    }
+
+    return matrix;
+}
+
+std::vector<uint8_t> column_multiplier_cauchy_matrix(int rows, int cols, Rng &rng)
+{
+    std::vector<uint8_t> matrix = cauchy_matrix(rows, cols, rng, nullptr);
+    if (rows == 0 || cols == 0) {
+        return matrix;
+    }
+
+    std::vector<uint8_t> column_scale(static_cast<std::size_t>(cols));
+    for (int col = 0; col < cols; col++) {
+        column_scale[static_cast<std::size_t>(col)] = rng.nonzero_byte();
+    }
+
+    for (int row = 0; row < rows; row++) {
+        for (int col = 0; col < cols; col++) {
+            auto pos = idx(row, col, cols);
+            matrix[pos] = gf256_mul(column_scale[static_cast<std::size_t>(col)], matrix[pos]);
         }
     }
 
@@ -174,11 +326,14 @@ std::vector<uint8_t> random_matrix(int rows, int cols, Rng &rng)
     return matrix;
 }
 
-std::vector<uint8_t> build_dense_matrix(MatrixFamily family, int rows, int cols, Rng &rng)
+std::vector<uint8_t> build_dense_matrix(MatrixFamily family, int rows, int cols, Rng &rng,
+                                        CauchyKeyBytes *cauchy_key)
 {
     switch (family) {
     case MatrixFamily::Cauchy:
-        return cauchy_matrix(rows, cols, rng);
+        return cauchy_matrix(rows, cols, rng, cauchy_key);
+    case MatrixFamily::ColumnMultiplierCauchy:
+        return column_multiplier_cauchy_matrix(rows, cols, rng);
     case MatrixFamily::Vandermonde:
         return vandermonde_matrix(rows, cols, rng);
     case MatrixFamily::Random:
@@ -209,6 +364,9 @@ std::vector<LocalGroup> build_groups(const Params &params)
     int local_row_start = params.data;
     for (int group_index = 0; group_index < params.groups; group_index++) {
         int size = base + (group_index < extra ? 1 : 0);
+        if (params.local_family == MatrixFamily::ColumnMultiplierCauchy) {
+            throw ValidationError("column_multiplier_cauchy is only supported for --global-method");
+        }
         if (params.local_family == MatrixFamily::Cauchy && size + params.local_parity > 256) {
             throw ValidationError("each local group needs data_count + local_parity <= 256");
         }
@@ -262,8 +420,9 @@ Code make_empty_code(const Params &params)
     code.global_family = params.global_family;
     code.construction = params.construction;
 
-    if (code.global_family == MatrixFamily::Cauchy && code.global_parity > 0 &&
-        code.data + code.global_parity > 256) {
+    if ((code.global_family == MatrixFamily::Cauchy ||
+         code.global_family == MatrixFamily::ColumnMultiplierCauchy) &&
+        code.global_parity > 0 && code.data + code.global_parity > 256) {
         throw ValidationError("cauchy global rows need data + global_parity <= 256 over GF(256)");
     }
     if (code.global_family == MatrixFamily::Vandermonde) {
@@ -288,12 +447,13 @@ void reset_identity(Code *code)
     }
 }
 
-void build_local_rows(Code *code, Rng &rng)
+void build_local_rows(Code *code, Rng &rng, CauchyKeyBytes *cauchy_key)
 {
     for (const auto &group : code->groups) {
         int group_data = static_cast<int>(group.data.size());
         std::vector<uint8_t> local =
-            build_dense_matrix(code->local_family, group.local_parity, group_data, rng);
+            build_dense_matrix(code->local_family, group.local_parity, group_data, rng,
+                               code->local_family == MatrixFamily::Cauchy ? cauchy_key : nullptr);
 
         for (int local_row = 0; local_row < group.local_parity; local_row++) {
             int matrix_row = group.local_row_start + local_row;
@@ -306,10 +466,12 @@ void build_local_rows(Code *code, Rng &rng)
     }
 }
 
-void build_global_rows(Code *code, Rng &rng)
+void build_global_rows(Code *code, Rng &rng, CauchyKeyBytes *cauchy_key)
 {
     int first_global = code->data + code->local_rows;
-    std::vector<uint8_t> global = build_dense_matrix(code->global_family, code->global_parity, code->data, rng);
+    std::vector<uint8_t> global =
+        build_dense_matrix(code->global_family, code->global_parity, code->data, rng,
+                           code->global_family == MatrixFamily::Cauchy ? cauchy_key : nullptr);
     for (int row = 0; row < code->global_parity; row++) {
         for (int col = 0; col < code->data; col++) {
             code->matrix[idx(first_global + row, col, code->data)] = global[idx(row, col, code->data)];
@@ -317,11 +479,36 @@ void build_global_rows(Code *code, Rng &rng)
     }
 }
 
-void build_candidate(Code *code, Rng &rng)
+void build_candidate(Code *code, Rng &rng, CauchyKeyBytes *cauchy_key)
 {
     reset_identity(code);
-    build_local_rows(code, rng);
-    build_global_rows(code, rng);
+    if (cauchy_key != nullptr) {
+        cauchy_key->clear();
+    }
+    build_local_rows(code, rng, cauchy_key);
+    build_global_rows(code, rng, cauchy_key);
+}
+
+bool use_cauchy_dedup(const Params &params)
+{
+    return params.cauchy_dedup && params.local_family == MatrixFamily::Cauchy &&
+           params.global_family == MatrixFamily::Cauchy;
+}
+
+uint64_t cauchy_dedup_key_bytes(const Code &code)
+{
+    uint64_t bytes = 0;
+    for (const auto &group : code.groups) {
+        if (group.local_parity > 0 && !group.data.empty()) {
+            bytes += static_cast<uint64_t>(group.local_parity) +
+                     static_cast<uint64_t>(group.data.size()) - 1;
+        }
+    }
+    if (code.global_parity > 0 && code.data > 0) {
+        bytes += static_cast<uint64_t>(code.global_parity) +
+                 static_cast<uint64_t>(code.data) - 1;
+    }
+    return bytes;
 }
 
 std::vector<int> group_symbol_ids(const Code &code, int group_index)
@@ -1598,6 +1785,8 @@ const char *family_name(MatrixFamily family)
     switch (family) {
     case MatrixFamily::Cauchy:
         return "cauchy";
+    case MatrixFamily::ColumnMultiplierCauchy:
+        return "column_multiplier_cauchy";
     case MatrixFamily::Vandermonde:
         return "vandermonde";
     case MatrixFamily::Random:
@@ -1610,6 +1799,11 @@ bool parse_family(const std::string &name, MatrixFamily *family)
 {
     if (name == "cauchy") {
         *family = MatrixFamily::Cauchy;
+        return true;
+    }
+    if (name == "column_multiplier_cauchy" || name == "column-multiplier-cauchy" ||
+        name == "cm_cauchy" || name == "cm-cauchy") {
+        *family = MatrixFamily::ColumnMultiplierCauchy;
         return true;
     }
     if (name == "vandermonde" || name == "rs") {
@@ -1683,18 +1877,35 @@ GenerateResult generate(const Params &params)
     try {
         Code base_code = make_empty_code(params);
         result.status = 2;
+        result.cauchy_dedup_enabled = use_cauchy_dedup(params);
+        if (result.cauchy_dedup_enabled) {
+            result.cauchy_dedup_key_bytes = cauchy_dedup_key_bytes(base_code);
+        }
 
         std::atomic<uint64_t> next_attempt{1};
-        std::atomic<uint64_t> completed_attempts{0};
+        std::atomic<uint64_t> attempts_done{0};
+        std::atomic<uint64_t> checked_candidates{0};
         std::atomic<uint64_t> total_patterns_checked{0};
         std::atomic<uint64_t> failed_candidates{0};
+        std::atomic<uint64_t> duplicate_candidates{0};
         std::atomic<bool> stop{false};
         std::atomic<bool> progress_done{false};
         std::mutex result_mutex;
+        std::mutex dedup_mutex;
         std::mutex progress_mutex;
         std::condition_variable progress_cv;
+        std::unique_ptr<CauchyDeduper> cauchy_deduper;
+        if (result.cauchy_dedup_enabled) {
+            cauchy_deduper = make_cauchy_deduper(result.cauchy_dedup_key_bytes);
+        }
         std::string worker_error;
         std::string progress_error;
+
+        auto finish_stats = [&]() {
+            result.attempts_done = attempts_done.load(std::memory_order_relaxed);
+            result.unique_candidates_checked = checked_candidates.load(std::memory_order_relaxed);
+            result.duplicate_candidates_skipped = duplicate_candidates.load(std::memory_order_relaxed);
+        };
 
         std::thread progress_worker;
         if (params.progress_callback && params.step_time != 0) {
@@ -1706,7 +1917,7 @@ GenerateResult generate(const Params &params)
                         break;
                     }
 
-                    uint64_t completed = completed_attempts.load(std::memory_order_relaxed);
+                    uint64_t completed = attempts_done.load(std::memory_order_relaxed);
                     lock.unlock();
                     try {
                         params.progress_callback(completed);
@@ -1742,10 +1953,22 @@ GenerateResult generate(const Params &params)
             Code code = base_code;
             code.attempt = attempt;
             Rng rng(seed_for_attempt(params.seed, attempt));
-            build_candidate(&code, rng);
+            CauchyKeyBytes cauchy_key;
+            CauchyKeyBytes *cauchy_key_ptr = result.cauchy_dedup_enabled ? &cauchy_key : nullptr;
+            build_candidate(&code, rng, cauchy_key_ptr);
+            attempts_done.fetch_add(1, std::memory_order_relaxed);
+
+            if (cauchy_key_ptr != nullptr) {
+                std::lock_guard<std::mutex> lock(dedup_mutex);
+                if (!cauchy_deduper->insert(cauchy_key)) {
+                    duplicate_candidates.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+            }
+
             CheckResult check = check_mr(code);
             total_patterns_checked.fetch_add(check.patterns_checked, std::memory_order_relaxed);
-            completed_attempts.fetch_add(1, std::memory_order_relaxed);
+            checked_candidates.fetch_add(1, std::memory_order_relaxed);
 
             if (check.is_mr) {
                 bool expected = false;
@@ -1817,25 +2040,27 @@ GenerateResult generate(const Params &params)
         }
 
         if (!progress_error.empty()) {
+            finish_stats();
             result.status = -1;
             result.message = progress_error;
             return result;
         }
 
         if (!worker_error.empty()) {
+            finish_stats();
             result.status = -1;
             result.message = worker_error;
             return result;
         }
 
-        result.attempts_done = completed_attempts.load(std::memory_order_relaxed);
+        finish_stats();
         if (result.status == 0) {
             return result;
         }
 
         result.status = 2;
         result.message = "no MR-LRC matrix found after " +
-                         std::to_string(completed_attempts.load(std::memory_order_relaxed)) + " attempts";
+                         std::to_string(attempts_done.load(std::memory_order_relaxed)) + " attempts";
         result.check.patterns_checked = total_patterns_checked.load(std::memory_order_relaxed);
         result.check.failures = failed_candidates.load(std::memory_order_relaxed);
         if (!result.code.matrix.empty()) {

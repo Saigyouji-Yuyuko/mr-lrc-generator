@@ -23,14 +23,18 @@ DEFINE_int32(local_parity, 0, "Local parity symbols per group.");
 DEFINE_int32(global_parity, 0, "Global parity symbols.");
 DEFINE_uint64(seed, 0, "Random seed. If omitted, a seed is generated and printed.");
 DEFINE_string(local_method, "cauchy", "Local parity construction: cauchy, vandermonde, random.");
-DEFINE_string(global_method, "cauchy", "Global parity construction: cauchy, vandermonde, random.");
-DEFINE_string(method, "", "Alias that sets both local_method and global_method.");
+DEFINE_string(global_method, "cauchy",
+              "Global parity construction: cauchy, column_multiplier_cauchy, vandermonde, random.");
+DEFINE_string(method, "",
+              "Alias that sets both local_method and global_method; global-only methods are rejected.");
 DEFINE_string(construction, "true",
               "Enable registered data-local constructions: true/false, on/off, 1/0, yes/no.");
 DEFINE_uint64(random_limit, std::numeric_limits<uint64_t>::max(), "Maximum random candidate attempts.");
 DEFINE_uint64(thread_count, 1, "Parallel search worker count, max 256.");
 DEFINE_uint64(step_time, 30, "Print search progress every N seconds; 0 disables progress.");
 DEFINE_string(json, "", "Write the found matrix as pretty JSON to this file.");
+DEFINE_bool(cauchy_dedup, false,
+            "Skip duplicate all-Cauchy candidates using canonical Cauchy parameter keys.");
 
 namespace {
 
@@ -102,6 +106,7 @@ std::string normalize_flag_name(const std::string &arg)
         {"--step-time", "--step_time"},
         {"--step-times", "--step_time"},
         {"--matrix-json", "--json"},
+        {"--cauchy-dedup", "--cauchy_dedup"},
         {"-k", "--data"},
         {"-g", "--groups"},
         {"-r", "--local_parity"},
@@ -126,6 +131,9 @@ std::string normalize_flag_name(const std::string &arg)
 
     if (arg == "--noconstruction") {
         return "--construction=false";
+    }
+    if (arg == "--no-cauchy-dedup") {
+        return "--nocauchy_dedup";
     }
     return arg;
 }
@@ -197,6 +205,7 @@ CliOptions parse_args(int argc, char **argv)
     opts.params.random_limit = FLAGS_random_limit;
     opts.params.thread_count = FLAGS_thread_count;
     opts.params.construction = parse_bool(FLAGS_construction);
+    opts.params.cauchy_dedup = FLAGS_cauchy_dedup;
     opts.params.step_time = FLAGS_step_time;
     if (opts.params.step_time != 0) {
         opts.params.progress_callback = [](uint64_t completed) {
@@ -336,6 +345,13 @@ int main(int argc, char **argv)
             if (!code.matrix.empty()) {
                 print_attribute("patterns_checked", result.check.patterns_checked);
                 print_attribute("failures", result.check.failures);
+                if (result.cauchy_dedup_enabled) {
+                    print_attribute("cauchy_dedup", "on");
+                    print_attribute("cauchy_dedup_key_bytes", result.cauchy_dedup_key_bytes);
+                    print_attribute("attempts_done", result.attempts_done);
+                    print_attribute("unique_candidates_checked", result.unique_candidates_checked);
+                    print_attribute("duplicates_skipped", result.duplicate_candidates_skipped);
+                }
                 print_failed_pattern(code, result.check.first_failed_erased);
             }
             gflags::ShutDownCommandLineFlags();
@@ -363,6 +379,13 @@ int main(int argc, char **argv)
         print_attribute("thread_count", opts.params.thread_count);
         print_attribute("attempt", code.attempt);
         print_attribute("patterns_checked", result.check.patterns_checked);
+        if (result.cauchy_dedup_enabled) {
+            print_attribute("cauchy_dedup", "on");
+            print_attribute("cauchy_dedup_key_bytes", result.cauchy_dedup_key_bytes);
+            print_attribute("attempts_done", result.attempts_done);
+            print_attribute("unique_candidates_checked", result.unique_candidates_checked);
+            print_attribute("duplicates_skipped", result.duplicate_candidates_skipped);
+        }
         print_attribute("gf256_backend", mrlrc::gf256_backend());
         print_layout(code);
         print_matrix(code);

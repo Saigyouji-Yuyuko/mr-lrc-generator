@@ -25,8 +25,9 @@ original full maximal-erasure checker is still run as a final gate.
 ## Features
 
 - Data-local systematic LRC layout.
-- Independent local and global construction methods:
-  `cauchy`, `vandermonde`, or `random`.
+- Independent local and global construction methods. Local rows support
+  `cauchy`, `vandermonde`, or `random`; global rows also support
+  `column_multiplier_cauchy`.
 - Exact residual MR check over all maximum erasure cases.
 - Optional `--seed` for deterministic random search; omitted seeds are
   generated and printed.
@@ -91,6 +92,9 @@ The shorter `--method` alias sets both local and global methods:
   --global-parity 2 --seed 1 --method cauchy
 ```
 
+Because `column_multiplier_cauchy` is global-only, select it with
+`--global-method` rather than `--method`.
+
 ## Options
 
 Required parameters:
@@ -108,13 +112,14 @@ Optional parameters:
 | --- | --- |
 | `-s`, `--seed S` | Random seed. If omitted, one is generated and printed. |
 | `--local-method M` | Local parity construction: `cauchy`, `vandermonde`, or `random`. |
-| `--global-method M` | Global parity construction: `cauchy`, `vandermonde`, or `random`. |
+| `--global-method M` | Global parity construction: `cauchy`, `column_multiplier_cauchy`, `vandermonde`, or `random`. |
 | `-m`, `--method M` | Alias that sets both local and global methods. |
 | `--construction BOOL` | Enable registered data-local constructions. Default: `true`. |
 | `--random-limit N` | Maximum candidate attempts. Default: unbounded `uint64` max. |
 | `-t`, `--thread-count N` | Parallel search worker count. Default: `1`, max: `256`. |
 | `--step_time N`, `--step-time N` | Print timestamped search progress to stderr every N seconds. Default: `30`; `0` disables it. |
 | `--json FILE`, `--matrix-json FILE` | Write the found matrix as pretty JSON to `FILE`. Standard output keeps the normal text report. |
+| `--cauchy-dedup` | Skip duplicate all-Cauchy candidates using canonical Cauchy parameter keys. Default: disabled. |
 | `-h`, `--help` | Print CLI help. |
 
 `--construction` accepts `true/false`, `on/off`, `1/0`, and `yes/no`. The
@@ -129,13 +134,28 @@ not part of the build.
 generators. The implementation picks distinct nonzero field parameters so the
 base construction parameters do not collide.
 
+`column_multiplier_cauchy` is a global-only method. It builds global rows from a
+Cauchy matrix, then multiplies every data column by an independently selected
+nonzero GF(256) scalar.
+
+With `--cauchy-dedup`, when both local and global methods are `cauchy`, the
+search keeps a canonical Cauchy-parameter key for each candidate. The key
+removes the common Cauchy xor translation and ignores permutations of global
+parity rows and of local parity rows within each local group, so equivalent
+candidates are not verified twice.
+
 `random` fills the selected parity rows with fully random GF(256) coefficients,
 including possible `00` coefficients. The exact MR checker is still the source
 of truth for whether the candidate is accepted.
 
 Local and global methods are independent. For example, `--local-method random
---global-method cauchy` creates fully random local parity rows and Cauchy global
-parity rows.
+--global-method column_multiplier_cauchy` creates fully random local parity rows
+and column-scaled Cauchy global parity rows.
+
+## Scale Notes
+
+For `data_cnt > 12`, using `global_parity >= 3` is not recommended. Wide LRC
+layouts are not supported, and `data_cnt >= 20` has not been tested.
 
 ## Search Model
 
