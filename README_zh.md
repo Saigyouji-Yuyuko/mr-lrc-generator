@@ -142,8 +142,10 @@ space 去重，然后把得到的小 GF(256) 矩阵和被擦除的 global parity
 `global_parity = 3` 时，会从 residual block 的 annihilator subspace 流式产生
 projective dual direction，并在找到失败 witness 时立即停止。当 `global_parity = 4`
 时，会先流式检查一小批 unique dual direction；若没有提前失败，再回退到精确
-dual index。通过 residual 检查的候选，还必须通过原始完整 erasure-pattern 枚举后
-才会被报告为 MR。
+dual index。两个 local group 的布局会使用直接的 kept-global-row projection fast
+path；每组只有一个 local parity 时，会用闭式列差公式构造 residual block，而不是
+做 Gaussian nullspace 消元。通过 residual 检查的候选，还必须通过原始完整
+erasure-pattern 枚举后才会被报告为 MR。
 
 `--random-limit` 限制候选矩阵的总尝试次数。`--thread-count` 只控制从同一尝试预算
 中领取任务的 worker 数，不会放大总尝试次数。多线程时，第一个完成并通过校验的

@@ -542,6 +542,8 @@ public:
         if (!should_stop()) {
             if (h_ == 2) {
                 verify_h2_fast_path();
+            } else if (code_.groups.size() == 2 && (h_ == 3 || h_ == 4)) {
+                verify_two_group_projection_fast_path();
             } else if (h_ == 3) {
                 verify_by_streaming_dual(0);
             } else if (h_ == 4 && !verify_by_streaming_dual(kH4StreamingDualLimit)) {
@@ -607,10 +609,54 @@ private:
         return matrix;
     }
 
+    uint8_t local_coefficient(int group_index, int symbol) const
+    {
+        const auto &group = code_.groups[static_cast<std::size_t>(group_index)];
+        if (symbol < code_.data) {
+            return code_.matrix[idx(group.local_row_start, symbol, code_.data)];
+        }
+        if (symbol == group.local_row_start) {
+            return 1;
+        }
+        return 0;
+    }
+
+    uint8_t global_coefficient(int global_row, int symbol) const
+    {
+        if (symbol >= code_.data) {
+            return 0;
+        }
+        int first_global = code_.data + code_.local_rows;
+        return code_.matrix[idx(first_global + global_row, symbol, code_.data)];
+    }
+
+    std::vector<uint8_t> build_residual_block_a1(int group_index,
+                                                 const std::vector<int> &erased_symbols,
+                                                 int extra) const
+    {
+        std::vector<uint8_t> residual(static_cast<std::size_t>(h_) * static_cast<std::size_t>(extra), 0);
+        int pivot = erased_symbols.front();
+        uint8_t inv_pivot = gf256_inv(local_coefficient(group_index, pivot));
+
+        for (int col = 0; col < extra; col++) {
+            int symbol = erased_symbols[static_cast<std::size_t>(col + 1)];
+            uint8_t scale = gf256_mul(local_coefficient(group_index, symbol), inv_pivot);
+            for (int row = 0; row < h_; row++) {
+                residual[idx(row, col, extra)] =
+                    global_coefficient(row, symbol) ^ gf256_mul(scale, global_coefficient(row, pivot));
+            }
+        }
+        return residual;
+    }
+
     std::vector<uint8_t> build_residual_block(int group_index, const std::vector<int> &erased_symbols,
                                               int extra) const
     {
         const auto &group = code_.groups[static_cast<std::size_t>(group_index)];
+        if (group.local_parity == 1) {
+            return build_residual_block_a1(group_index, erased_symbols, extra);
+        }
+
         std::vector<uint8_t> local = build_local_submatrix(group_index, erased_symbols);
         std::vector<uint8_t> nullspace =
             gf256_nullspace_basis(local, group.local_parity, static_cast<int>(erased_symbols.size()));
@@ -799,6 +845,107 @@ private:
         std::vector<int> kept_rows;
         check_global_completions(current, used, 0, &kept_rows);
         return !should_stop();
+    }
+
+    struct ProjectedBlock {
+        const ResidualBlock *source = nullptr;
+        std::vector<uint8_t> matrix;
+    };
+
+    bool projected_blocks_for_group(int group_index, int extra, const std::vector<int> &kept_rows,
+                                    std::vector<ProjectedBlock> *projected)
+    {
+        projected->clear();
+        if (extra == 0) {
+            projected->push_back(ProjectedBlock{nullptr, {}});
+            return true;
+        }
+
+        const auto &group_blocks = residual_blocks_[static_cast<std::size_t>(group_index)];
+        if (extra >= static_cast<int>(group_blocks.by_extra.size())) {
+            return true;
+        }
+
+        int rows = static_cast<int>(kept_rows.size());
+        projected->reserve(group_blocks.by_extra[static_cast<std::size_t>(extra)].size());
+        for (const auto &block : group_blocks.by_extra[static_cast<std::size_t>(extra)]) {
+            std::vector<uint8_t> matrix = project_rows(block.matrix, h_, extra, kept_rows);
+            result_->patterns_checked++;
+            if (gf256_rank(matrix, rows, extra) < extra) {
+                std::vector<std::vector<int>> group_erased(code_.groups.size());
+                group_erased[static_cast<std::size_t>(group_index)] = block.erased_symbols;
+                mark_failure_with_erased(group_erased, kept_rows);
+                return false;
+            }
+            projected->push_back(ProjectedBlock{&block, std::move(matrix)});
+        }
+        return true;
+    }
+
+    bool check_two_group_projection_case(const std::vector<int> &kept_rows, int extra0, int extra1)
+    {
+        int rows = static_cast<int>(kept_rows.size());
+        std::vector<ProjectedBlock> group0;
+        std::vector<ProjectedBlock> group1;
+        if (!projected_blocks_for_group(0, extra0, kept_rows, &group0) ||
+            !projected_blocks_for_group(1, extra1, kept_rows, &group1)) {
+            return false;
+        }
+
+        for (const auto &left : group0) {
+            for (const auto &right : group1) {
+                if (extra0 == 0 || extra1 == 0) {
+                    continue;
+                }
+
+                std::vector<uint8_t> joined =
+                    append_columns(left.matrix, rows, extra0, right.matrix, extra1);
+                result_->patterns_checked++;
+                if (gf256_rank(joined, rows, rows) < rows) {
+                    std::vector<std::vector<int>> group_erased(code_.groups.size());
+                    group_erased[0] = left.source->erased_symbols;
+                    group_erased[1] = right.source->erased_symbols;
+                    mark_failure_with_erased(group_erased, kept_rows);
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    bool check_two_group_rows(const std::vector<int> &kept_rows)
+    {
+        int residual_size = static_cast<int>(kept_rows.size());
+        for (int extra0 = 0; extra0 <= residual_size; extra0++) {
+            int extra1 = residual_size - extra0;
+            if (!check_two_group_projection_case(kept_rows, extra0, extra1)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool verify_two_group_projection_fast_path()
+    {
+        std::vector<int> rows;
+        rows.reserve(static_cast<std::size_t>(h_));
+        for (int row = 0; row < h_; row++) {
+            rows.push_back(row);
+        }
+
+        for (int residual_size = 1; residual_size <= h_; residual_size++) {
+            std::vector<int> kept_rows;
+            if (!enumerate_combinations(rows, residual_size, 0, &kept_rows,
+                                        [&](const std::vector<int> &choice) {
+                                            if (should_stop()) {
+                                                return false;
+                                            }
+                                            return check_two_group_rows(choice);
+                                        })) {
+                return false;
+            }
+        }
+        return true;
     }
 
     std::vector<uint8_t> block_vector(const ResidualBlock &block) const

@@ -155,7 +155,10 @@ projective-line fast path. For `global_parity = 3`, it streams projective dual
 directions from residual-block annihilator subspaces and stops as soon as a
 failure witness is found. For `global_parity = 4`, it runs the same streaming
 check up to a small unique-dual threshold, then falls back to an exact dual index
-if no early failure is found. A candidate that passes this residual check is then
+if no early failure is found. Two-local-group layouts use a direct projection
+fast path over kept global rows, and single-local-parity groups build residual
+blocks with a closed-form column-difference formula instead of Gaussian
+nullspace elimination. A candidate that passes this residual check is then
 validated by the original full erasure-pattern enumeration before it is reported
 as MR.
 
