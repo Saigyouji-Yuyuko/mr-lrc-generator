@@ -29,7 +29,7 @@ struct Params {
     bool construction = true;
     bool cauchy_dedup = false;
     uint64_t step_time = 0;
-    std::function<void(uint64_t)> progress_callback;
+    std::function<void(uint64_t, uint64_t, uint64_t)> progress_callback;
 };
 
 struct LocalGroup {
@@ -57,6 +57,7 @@ struct Code {
 
 struct CheckResult {
     bool is_mr = false;
+    bool strict_complete = false;
     uint64_t patterns_checked = 0;
     uint64_t failures = 0;
     std::string message;
@@ -70,6 +71,7 @@ struct GenerateResult {
     CheckResult check;
     uint64_t attempts_done = 0;
     uint64_t unique_candidates_checked = 0;
+    uint64_t strict_candidates_checked = 0;
     uint64_t duplicate_candidates_skipped = 0;
     uint64_t cauchy_dedup_key_bytes = 0;
     bool cauchy_dedup_enabled = false;

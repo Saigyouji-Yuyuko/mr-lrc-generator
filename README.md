@@ -115,7 +115,7 @@ Optional parameters:
 | `--construction BOOL` | Enable registered data-local constructions. Default: `true`. |
 | `--random-limit N` | Maximum candidate attempts. Default: unbounded `uint64` max. |
 | `-t`, `--thread-count N` | Parallel search worker count. Default: `1`, max: `256`. |
-| `--step_time N`, `--step-time N` | Print timestamped search progress to stderr every N seconds. Default: `30`; `0` disables it. |
+| `--step_time N`, `--step-time N` | Print timestamped searched and strict-complete counts to stderr every N seconds. Default: `30`; `0` disables it. |
 | `--json FILE`, `--matrix-json FILE` | Write the found matrix as pretty JSON to `FILE`. Standard output keeps the normal text report. |
 | `--cauchy-dedup` | Skip duplicate all-Cauchy candidates using canonical Cauchy parameter keys. Default: disabled. |
 | `-h`, `--help` | Print CLI help. |
@@ -153,8 +153,8 @@ and column-scaled Cauchy global parity rows.
 ## Scale Notes
 
 - For `data_cnt > 12`, using `global_parity >= 3` is not recommended.
-- Wide LRC layouts are not supported.
-- `data_cnt >= 20` has not been tested.
+- Using `global_parity >= 4` is not recommended.
+- Wide LRC layouts are not supported; `data_cnt > 24` has not been tested.
 
 ## Verification Model
 

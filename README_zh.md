@@ -110,7 +110,7 @@ local 和 global parity row 可以使用不同构造方法：
 | `--construction BOOL` | 启用已注册的 data-local 构造。默认：`true`。 |
 | `--random-limit N` | 最大候选尝试次数。默认：无界 `uint64` 最大值。 |
 | `-t`, `--thread-count N` | 并行搜索 worker 数。默认：`1`，最大：`256`。 |
-| `--step_time N`, `--step-time N` | 每 N 秒向 stderr 打印带时间戳的搜索进度。默认：`30`；`0` 表示关闭。 |
+| `--step_time N`, `--step-time N` | 每 N 秒向 stderr 打印带时间戳的搜索数和严格完成检查数。默认：`30`；`0` 表示关闭。 |
 | `--json FILE`, `--matrix-json FILE` | 将找到的矩阵以 pretty JSON 写入 `FILE`。标准输出仍保持普通文本报告。 |
 | `--cauchy-dedup` | 对全 Cauchy 候选使用规范化 Cauchy 参数 key 跳过重复验证。默认关闭。 |
 | `-h`, `--help` | 打印 CLI 帮助。 |
@@ -142,8 +142,8 @@ global parity row。
 ## 规模说明
 
 - 当 `data_cnt > 12` 时，不建议选择 `global_parity >= 3`。
-- 当前不支持 wide LRC。
-- `data_cnt >= 20` 的情形没有测试过。
+- 不建议选择 `global_parity >= 4`。
+- 当前不支持 wide LRC；`data_cnt > 24` 的情形没有测试过。
 
 ## 校验模型
 

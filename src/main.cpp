@@ -208,12 +208,14 @@ CliOptions parse_args(int argc, char **argv)
     opts.params.cauchy_dedup = FLAGS_cauchy_dedup;
     opts.params.step_time = FLAGS_step_time;
     if (opts.params.step_time != 0) {
-        opts.params.progress_callback = [](uint64_t completed) {
+        opts.params.progress_callback = [](uint64_t step, uint64_t searched, uint64_t strict_checked) {
             std::time_t now = std::time(nullptr);
             std::tm local_time{};
             localtime_r(&now, &local_time);
-            std::cerr << std::put_time(&local_time, "%F %T")
-                      << " has search " << completed << " count\n";
+            std::cerr << "step: " << step << " "
+                      << std::put_time(&local_time, "%F %T")
+                      << " search: " << searched
+                      << ", strict search:" << strict_checked << ";\n";
         };
     }
     opts.json_path = FLAGS_json;
@@ -350,6 +352,7 @@ int main(int argc, char **argv)
                     print_attribute("cauchy_dedup_key_bytes", result.cauchy_dedup_key_bytes);
                     print_attribute("attempts_done", result.attempts_done);
                     print_attribute("unique_candidates_checked", result.unique_candidates_checked);
+                    print_attribute("strict_candidates_checked", result.strict_candidates_checked);
                     print_attribute("duplicates_skipped", result.duplicate_candidates_skipped);
                 }
                 print_failed_pattern(code, result.check.first_failed_erased);
@@ -384,6 +387,7 @@ int main(int argc, char **argv)
             print_attribute("cauchy_dedup_key_bytes", result.cauchy_dedup_key_bytes);
             print_attribute("attempts_done", result.attempts_done);
             print_attribute("unique_candidates_checked", result.unique_candidates_checked);
+            print_attribute("strict_candidates_checked", result.strict_candidates_checked);
             print_attribute("duplicates_skipped", result.duplicate_candidates_skipped);
         }
         print_attribute("gf256_backend", mrlrc::gf256_backend());

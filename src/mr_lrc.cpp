@@ -1860,12 +1860,14 @@ CheckResult check_mr(const Code &code)
     result.patterns_checked += gate.patterns_checked;
     if (!gate.is_mr) {
         result.is_mr = false;
+        result.strict_complete = false;
         result.failures = gate.failures;
         result.first_failed_erased = std::move(gate.first_failed_erased);
         result.message = "residual checker passed, but the full maximal erasure gate failed";
         return result;
     }
 
+    result.strict_complete = true;
     result.message =
         "candidate passed residual verification and the full maximal erasure gate";
     return result;
@@ -1885,6 +1887,7 @@ GenerateResult generate(const Params &params)
         std::atomic<uint64_t> next_attempt{1};
         std::atomic<uint64_t> attempts_done{0};
         std::atomic<uint64_t> checked_candidates{0};
+        std::atomic<uint64_t> strict_candidates{0};
         std::atomic<uint64_t> total_patterns_checked{0};
         std::atomic<uint64_t> failed_candidates{0};
         std::atomic<uint64_t> duplicate_candidates{0};
@@ -1904,6 +1907,7 @@ GenerateResult generate(const Params &params)
         auto finish_stats = [&]() {
             result.attempts_done = attempts_done.load(std::memory_order_relaxed);
             result.unique_candidates_checked = checked_candidates.load(std::memory_order_relaxed);
+            result.strict_candidates_checked = strict_candidates.load(std::memory_order_relaxed);
             result.duplicate_candidates_skipped = duplicate_candidates.load(std::memory_order_relaxed);
         };
 
@@ -1911,16 +1915,19 @@ GenerateResult generate(const Params &params)
         if (params.progress_callback && params.step_time != 0) {
             progress_worker = std::thread([&]() {
                 std::unique_lock<std::mutex> lock(progress_mutex);
+                uint64_t progress_step = 0;
                 for (;;) {
                     if (progress_cv.wait_for(lock, std::chrono::seconds(params.step_time),
                                              [&]() { return progress_done.load(std::memory_order_relaxed); })) {
                         break;
                     }
 
-                    uint64_t completed = attempts_done.load(std::memory_order_relaxed);
+                    progress_step++;
+                    uint64_t searched = attempts_done.load(std::memory_order_relaxed);
+                    uint64_t strict_checked = strict_candidates.load(std::memory_order_relaxed);
                     lock.unlock();
                     try {
-                        params.progress_callback(completed);
+                        params.progress_callback(progress_step, searched, strict_checked);
                     } catch (const std::exception &ex) {
                         {
                             std::lock_guard<std::mutex> result_lock(result_mutex);
@@ -1969,6 +1976,9 @@ GenerateResult generate(const Params &params)
             CheckResult check = check_mr(code);
             total_patterns_checked.fetch_add(check.patterns_checked, std::memory_order_relaxed);
             checked_candidates.fetch_add(1, std::memory_order_relaxed);
+            if (check.strict_complete) {
+                strict_candidates.fetch_add(1, std::memory_order_relaxed);
+            }
 
             if (check.is_mr) {
                 bool expected = false;
