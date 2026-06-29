@@ -31,6 +31,7 @@ and verifies recoverability over GF(256).
   generated and printed.
 - Search bound via `--random-limit`.
 - Parallel search via `--thread-count`.
+- Optional stress-test prefilter before exact verification.
 - ISA-L-backed GF(256) arithmetic.
 
 ## Build
@@ -114,9 +115,10 @@ Optional parameters:
 | `-m`, `--method M` | Alias that sets both local and global methods. |
 | `--construction BOOL` | Enable registered data-local constructions. Default: `true`. |
 | `--random-limit N` | Maximum candidate attempts. Default: unbounded `uint64` max. |
+| `--prefilter-count N`, `--random-prefilter N`, `--stress-prefilter N` | Stress-test patterns to run before exact verification for each candidate. Default: `0` disables the prefilter. |
 | `-t`, `--thread-count N` | Parallel search worker count. Default: `1`, max: `256`. |
 | `--step_time N`, `--step-time N` | Print timestamped searched and strict-complete counts to stderr every N seconds. Default: `30`; `0` disables it. |
-| `--json FILE`, `--matrix-json FILE` | Write the found matrix as pretty JSON to `FILE`. Standard output keeps the normal text report. |
+| `--json FILE`, `--matrix-json FILE` | Write the found result as pretty JSON to `FILE`, including stdout metadata, local groups, and decimal/hex matrices. Standard output keeps the normal text report. |
 | `--cauchy-dedup` | Skip duplicate all-Cauchy candidates using canonical Cauchy parameter keys. Default: disabled. |
 | `-h`, `--help` | Print CLI help. |
 
@@ -142,13 +144,15 @@ removes the common Cauchy xor translation and ignores permutations of global
 parity rows and of local parity rows within each local group, so equivalent
 candidates are not verified twice.
 
-`random` fills the selected parity rows with fully random GF(256) coefficients,
-including possible `00` coefficients. The exact MR checker is still the source
-of truth for whether the candidate is accepted.
+`random` fills selected parity rows with random GF(256) coefficients. Local
+random rows use nonzero coefficients to preserve the local pivot invariant used
+by residual elimination; global random rows may still include `00`
+coefficients. The exact MR checker is still the source of truth for whether the
+candidate is accepted.
 
 Local and global methods are independent. For example, `--local-method random
---global-method column_multiplier_cauchy` creates fully random local parity rows
-and column-scaled Cauchy global parity rows.
+--global-method column_multiplier_cauchy` creates nonzero random local parity
+rows and column-scaled Cauchy global parity rows.
 
 ## Scale Notes
 
@@ -168,6 +172,18 @@ A maximum erasure pattern has size `total_parity` and must erase at least
 `local_parity` symbols in every local group, then spend the remaining erasure
 budget globally. The checker enumerates these maximum erasure patterns and
 accepts a candidate only when every enumerated case is recoverable.
+
+`--prefilter-count` builds that many stress-probe recipes before the search
+starts, then runs those recipes for each candidate before the exact checker. For
+the common `local_parity=1`, `groups=2..6`, `global_parity=2..4` range, the
+probe schedule prioritizes residual shapes such as line collisions,
+vector-in-plane cases, plane intersections, hyperplane-vector cases, and small
+multi-vector rank defects. If the targeted schedule is exhausted, remaining
+budget falls back to residual random maximum-erasure samples. A candidate
+rejected by the prefilter is genuinely non-MR because each witness is confirmed
+with the same local-elimination residual rank criterion used by the exact
+verifier; candidates that pass the prefilter still go through the exact checker
+and full gate.
 
 `--random-limit` bounds the total number of candidate matrices. `--thread-count`
 only controls how many workers draw from that shared attempt budget; it does not

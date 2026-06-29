@@ -39,6 +39,25 @@ run_fail_case() {
 run_case "small_cauchy" -k 4 -g 2 -r 1 -p 1 -s 7 --construction false -m cauchy
 run_case "seed_optional" -k 4 -g 2 -r 1 -p 1 --construction false -m cauchy --random-limit 1
 run_case "json_output" -k 4 -g 2 -r 1 -p 1 -s 7 --construction false -m cauchy --json "$json_file"
+
+expect_json_text() {
+    local needle="$1"
+
+    if grep -Fq "$needle" "$json_file"; then
+        return
+    fi
+
+    printf 'not ok json_output_contains_%s\n' "$needle" >&2
+    sed -n '1,160p' "$json_file" >&2
+    return 1
+}
+
+expect_json_text '"candidate_source":'
+expect_json_text '"gf256_backend":'
+expect_json_text '"groups": ['
+expect_json_text '    { "data": [0, 1], "local": [4] },'
+expect_json_text '"matrix_hex": ['
+
 run_case "cauchy_dedup" -k 4 -g 2 -r 1 -p 1 -s 7 --construction false -m cauchy --cauchy-dedup
 run_case "three_group_cauchy" -k 6 -g 3 -r 1 -p 2 -s 123 --construction false --local-method cauchy --global-method cauchy
 run_case "global_column_multiplier_cauchy" -k 6 -g 2 -r 1 -p 2 -s 17 --construction false --local-method cauchy --global-method column_multiplier_cauchy
@@ -46,6 +65,8 @@ run_fail_case "local_column_multiplier_cauchy_rejected" -k 4 -g 2 -r 1 -p 1 -s 7
 run_case "small_vandermonde" -k 4 -g 2 -r 1 -p 1 -s 7 --construction false --local-method vandermonde --global-method vandermonde
 run_case "local_a2_random_global" -k 6 -g 2 -r 2 -p 1 -s 99 --construction false --local-method cauchy --global-method random
 run_case "random_random_limit" -k 6 -g 2 -r 1 -p 2 -s 1 --construction false --local-method random --global-method random --random-limit 10
+run_case "random_stress_prefilter" -k 6 -g 2 -r 1 -p 2 -s 1 --construction false -m cauchy --prefilter-count 8
+run_fail_case "targeted_prefilter_10_2_4_rejects" -k 10 -g 2 -r 1 -p 4 -s 1 --construction false --local-method cauchy --global-method column_multiplier_cauchy --random-limit 1 --prefilter-count 1
 run_case "vandermonde_random_threads" -k 6 -g 2 -r 1 -p 2 -s 1 --construction false --local-method vandermonde --global-method random --thread-count 2
 run_case "random_cauchy_threads" -k 6 -g 2 -r 1 -p 2 -s 1 --construction false --local-method random --global-method cauchy --random-limit 10 --thread-count 4
 run_case "construction_default_6_2_2" -k 6 -g 2 -r 1 -p 2 -s 1 --random-limit 1

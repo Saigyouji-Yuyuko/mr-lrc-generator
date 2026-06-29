@@ -35,6 +35,8 @@ DEFINE_uint64(step_time, 30, "Print search progress every N seconds; 0 disables 
 DEFINE_string(json, "", "Write the found matrix as pretty JSON to this file.");
 DEFINE_bool(cauchy_dedup, false,
             "Skip duplicate all-Cauchy candidates using canonical Cauchy parameter keys.");
+DEFINE_uint64(prefilter_count, 0,
+              "Stress-test patterns per candidate before exact verification; 0 disables.");
 
 namespace {
 
@@ -56,6 +58,7 @@ std::string usage_message()
            "  -t, --thread-count N\n"
            "  -m, --method M\n"
            "  --local-method M, --global-method M, --random-limit N\n"
+           "  --prefilter-count N\n"
            "  --json FILE\n";
 }
 
@@ -107,6 +110,9 @@ std::string normalize_flag_name(const std::string &arg)
         {"--step-times", "--step_time"},
         {"--matrix-json", "--json"},
         {"--cauchy-dedup", "--cauchy_dedup"},
+        {"--prefilter-count", "--prefilter_count"},
+        {"--random-prefilter", "--prefilter_count"},
+        {"--stress-prefilter", "--prefilter_count"},
         {"-k", "--data"},
         {"-g", "--groups"},
         {"-r", "--local_parity"},
@@ -206,6 +212,7 @@ CliOptions parse_args(int argc, char **argv)
     opts.params.thread_count = FLAGS_thread_count;
     opts.params.construction = parse_bool(FLAGS_construction);
     opts.params.cauchy_dedup = FLAGS_cauchy_dedup;
+    opts.params.prefilter_count = FLAGS_prefilter_count;
     opts.params.step_time = FLAGS_step_time;
     if (opts.params.step_time != 0) {
         opts.params.progress_callback = [](uint64_t step, uint64_t searched, uint64_t strict_checked) {
@@ -273,13 +280,109 @@ void print_matrix(const mrlrc::Code &code)
     }
 }
 
-void print_matrix_json(std::ostream &out, const mrlrc::Code &code, int local_parity)
+void print_json_string(std::ostream &out, const std::string &value)
 {
-    out << "{\n";
-    out << "  \"data_cnt\": " << code.data << ",\n";
-    out << "  \"group_cnt\": " << code.groups.size() << ",\n";
-    out << "  \"local_parity_cnt\": " << local_parity << ",\n";
-    out << "  \"global_parity_cnt\": " << code.global_parity << ",\n";
+    out << '"';
+    for (unsigned char ch : value) {
+        switch (ch) {
+        case '"':
+            out << "\\\"";
+            break;
+        case '\\':
+            out << "\\\\";
+            break;
+        case '\b':
+            out << "\\b";
+            break;
+        case '\f':
+            out << "\\f";
+            break;
+        case '\n':
+            out << "\\n";
+            break;
+        case '\r':
+            out << "\\r";
+            break;
+        case '\t':
+            out << "\\t";
+            break;
+        default:
+            if (ch < 0x20) {
+                auto flags = out.flags();
+                auto fill = out.fill();
+                out << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+                    << static_cast<unsigned>(ch);
+                out.flags(flags);
+                out.fill(fill);
+            } else {
+                out << static_cast<char>(ch);
+            }
+            break;
+        }
+    }
+    out << '"';
+}
+
+void print_json_array(std::ostream &out, const std::vector<int> &values)
+{
+    out << "[";
+    for (std::size_t i = 0; i < values.size(); i++) {
+        if (i != 0) {
+            out << ", ";
+        }
+        out << values[i];
+    }
+    out << "]";
+}
+
+void print_json_hex_byte(std::ostream &out, uint8_t value)
+{
+    auto flags = out.flags();
+    auto fill = out.fill();
+    out << '"' << std::hex << std::setw(2) << std::setfill('0')
+        << static_cast<unsigned>(value) << '"';
+    out.flags(flags);
+    out.fill(fill);
+}
+
+void print_groups_json(std::ostream &out, const mrlrc::Code &code)
+{
+    out << "  \"groups\": [\n";
+    for (std::size_t group_index = 0; group_index < code.groups.size(); group_index++) {
+        const auto &group = code.groups[group_index];
+        std::vector<int> local;
+        local.reserve(static_cast<std::size_t>(group.local_parity));
+        for (int local_index = 0; local_index < group.local_parity; local_index++) {
+            local.push_back(group.local_row_start + local_index);
+        }
+
+        out << "    { \"data\": ";
+        print_json_array(out, group.data);
+        out << ", \"local\": ";
+        print_json_array(out, local);
+        out << " }";
+        if (group_index + 1 != code.groups.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << "  ],\n";
+}
+
+void print_row_labels_json(std::ostream &out, const mrlrc::Code &code)
+{
+    out << "  \"row_labels\": [";
+    for (int row = 0; row < code.symbols; row++) {
+        if (row != 0) {
+            out << ", ";
+        }
+        print_json_string(out, mrlrc::symbol_label(code, row));
+    }
+    out << "],\n";
+}
+
+void print_matrix_decimal_json(std::ostream &out, const mrlrc::Code &code)
+{
     out << "  \"matrix\": [\n";
     for (int row = 0; row < code.symbols; row++) {
         out << "    [";
@@ -297,17 +400,97 @@ void print_matrix_json(std::ostream &out, const mrlrc::Code &code, int local_par
         }
         out << "\n";
     }
+    out << "  ],\n";
+}
+
+void print_matrix_hex_json(std::ostream &out, const mrlrc::Code &code)
+{
+    out << "  \"matrix_hex\": [\n";
+    for (int row = 0; row < code.symbols; row++) {
+        out << "    [";
+        for (int col = 0; col < code.data; col++) {
+            if (col != 0) {
+                out << ", ";
+            }
+            auto pos = static_cast<std::size_t>(row) * static_cast<std::size_t>(code.data) +
+                       static_cast<std::size_t>(col);
+            print_json_hex_byte(out, code.matrix[pos]);
+        }
+        out << "]";
+        if (row + 1 != code.symbols) {
+            out << ",";
+        }
+        out << "\n";
+    }
     out << "  ]\n";
+}
+
+void print_matrix_json(std::ostream &out, const mrlrc::GenerateResult &result,
+                       const mrlrc::Params &params)
+{
+    const auto &code = result.code;
+    out << "{\n";
+    out << "  \"status\": \"found\",\n";
+    out << "  \"data\": " << code.data << ",\n";
+    out << "  \"data_cnt\": " << code.data << ",\n";
+    out << "  \"group_cnt\": " << code.groups.size() << ",\n";
+    out << "  \"local_parity\": " << params.local_parity << ",\n";
+    out << "  \"local_parity_cnt\": " << params.local_parity << ",\n";
+    out << "  \"local_rows\": " << code.local_rows << ",\n";
+    out << "  \"global_parity\": " << code.global_parity << ",\n";
+    out << "  \"global_parity_cnt\": " << code.global_parity << ",\n";
+    out << "  \"total_parity\": " << code.total_parity << ",\n";
+    out << "  \"symbols\": " << code.symbols << ",\n";
+    out << "  \"construction\": " << (code.construction ? "true" : "false") << ",\n";
+    out << "  \"candidate_source\": ";
+    print_json_string(out, code.candidate_source);
+    out << ",\n";
+    out << "  \"local_method\": ";
+    print_json_string(out, mrlrc::family_name(code.local_family));
+    out << ",\n";
+    out << "  \"global_method\": ";
+    print_json_string(out, mrlrc::family_name(code.global_family));
+    out << ",\n";
+    out << "  \"seed\": " << code.seed << ",\n";
+    out << "  \"random_limit\": " << params.random_limit << ",\n";
+    out << "  \"thread_count\": " << params.thread_count << ",\n";
+    out << "  \"attempt\": " << code.attempt << ",\n";
+    out << "  \"patterns_checked\": " << result.check.patterns_checked << ",\n";
+    if (result.prefilter_enabled) {
+        out << "  \"prefilter_count\": " << params.prefilter_count << ",\n";
+        out << "  \"prefilter_candidates_checked\": "
+            << result.prefilter_candidates_checked << ",\n";
+        out << "  \"prefilter_candidates_rejected\": "
+            << result.prefilter_candidates_rejected << ",\n";
+        out << "  \"prefilter_patterns_checked\": "
+            << result.prefilter_patterns_checked << ",\n";
+    }
+    if (result.cauchy_dedup_enabled) {
+        out << "  \"cauchy_dedup\": true,\n";
+        out << "  \"cauchy_dedup_key_bytes\": " << result.cauchy_dedup_key_bytes << ",\n";
+        out << "  \"attempts_done\": " << result.attempts_done << ",\n";
+        out << "  \"unique_candidates_checked\": " << result.unique_candidates_checked << ",\n";
+        out << "  \"strict_candidates_checked\": " << result.strict_candidates_checked << ",\n";
+        out << "  \"duplicates_skipped\": " << result.duplicate_candidates_skipped << ",\n";
+    }
+    out << "  \"gf256_backend\": ";
+    print_json_string(out, mrlrc::gf256_backend());
+    out << ",\n";
+    print_groups_json(out, code);
+    print_row_labels_json(out, code);
+    print_matrix_decimal_json(out, code);
+    print_matrix_hex_json(out, code);
     out << "}\n";
 }
 
-void write_matrix_json_file(const std::string &path, const mrlrc::Code &code, int local_parity)
+void write_matrix_json_file(const std::string &path, const mrlrc::GenerateResult &result,
+                            const mrlrc::Params &params)
 {
     std::ofstream out(path);
     if (!out) {
         throw CliError("could not open JSON output file: " + path);
     }
-    print_matrix_json(out, code, local_parity);
+    print_matrix_json(out, result, params);
     if (!out) {
         throw CliError("could not write JSON output file: " + path);
     }
@@ -330,6 +513,17 @@ template <typename T>
 void print_attribute(const char *name, const T &value)
 {
     std::cout << name << "=" << value << "\n";
+}
+
+void print_prefilter_stats(const mrlrc::GenerateResult &result, uint64_t prefilter_count)
+{
+    if (!result.prefilter_enabled) {
+        return;
+    }
+    print_attribute("prefilter_count", prefilter_count);
+    print_attribute("prefilter_candidates_checked", result.prefilter_candidates_checked);
+    print_attribute("prefilter_candidates_rejected", result.prefilter_candidates_rejected);
+    print_attribute("prefilter_patterns_checked", result.prefilter_patterns_checked);
 }
 
 } // namespace
@@ -355,6 +549,7 @@ int main(int argc, char **argv)
                     print_attribute("strict_candidates_checked", result.strict_candidates_checked);
                     print_attribute("duplicates_skipped", result.duplicate_candidates_skipped);
                 }
+                print_prefilter_stats(result, opts.params.prefilter_count);
                 print_failed_pattern(code, result.check.first_failed_erased);
             }
             gflags::ShutDownCommandLineFlags();
@@ -362,7 +557,7 @@ int main(int argc, char **argv)
         }
 
         if (!opts.json_path.empty()) {
-            write_matrix_json_file(opts.json_path, code, opts.params.local_parity);
+            write_matrix_json_file(opts.json_path, result, opts.params);
         }
 
         std::cout << "MR-LRC matrix found\n";
@@ -382,6 +577,7 @@ int main(int argc, char **argv)
         print_attribute("thread_count", opts.params.thread_count);
         print_attribute("attempt", code.attempt);
         print_attribute("patterns_checked", result.check.patterns_checked);
+        print_prefilter_stats(result, opts.params.prefilter_count);
         if (result.cauchy_dedup_enabled) {
             print_attribute("cauchy_dedup", "on");
             print_attribute("cauchy_dedup_key_bytes", result.cauchy_dedup_key_bytes);
