@@ -96,22 +96,8 @@ The shorter `--method` alias sets both local and global methods:
 Because `column_multiplier_cauchy` is global-only, select it with
 `--global-method` rather than `--method`.
 
-For the common data-local `LRC(k,l,2)` shape, `--construction 1` enables the
-dedicated `h=2` difference-pack construction. It can produce much larger codes
-than the generic random search path:
-
-```bash
-./build/mr-lrc-generator \
-  --data 64 \
-  --groups 8 \
-  --local-parity 1 \
-  --global-parity 2 \
-  --construction 1 \
-  --random-limit 1 \
-  --step-time 0
-```
-
-Successful output reports `candidate_source=difference_pack_h2`.
+For large data-local `LRC(k,l,2)` parameters, use the dedicated h=2 construction
+described in [H=2 Difference-Pack Construction](#h2-difference-pack-construction).
 
 ## Options
 
@@ -132,7 +118,7 @@ Optional parameters:
 | `--local-method M` | Local parity construction: `cauchy`, `vandermonde`, or `random`. |
 | `--global-method M` | Global parity construction: `cauchy`, `column_multiplier_cauchy`, `vandermonde`, or `random`. |
 | `-m`, `--method M` | Alias that sets both local and global methods. |
-| `--construction N` | `h=2` difference-pack construction attempts before random search. Default: `0` disables construction. |
+| `--construction N` | h=2 difference-pack construction attempt budget before random search. Default: `0` disables construction; recommended h=2 value: `10000`. |
 | `--random-limit N` | Maximum candidate attempts. Default: unbounded `uint64` max. |
 | `--prefilter-count N`, `--random-prefilter N`, `--stress-prefilter N` | Stress-test patterns to run before exact verification for each candidate. Default: `0` disables the prefilter. |
 | `-t`, `--thread-count N` | Parallel search worker count. Default: `1`, max: `256`. |
@@ -142,24 +128,81 @@ Optional parameters:
 | `--cauchy-dedup` | Skip duplicate all-Cauchy candidates using canonical Cauchy parameter keys. Default: disabled. |
 | `-h`, `--help` | Print CLI help. |
 
-`--construction N` tries up to `N` registered data-local construction attempts
-before random candidate search; `0` disables construction. The registered
-construction is `difference_pack_h2`, a GF(256) data-local construction for
-`local_parity=1` and `global_parity=2`. It picks per-group labels whose pairwise
-xor difference sets are disjoint, uses unit local rows, and sets global rows to
-`(t, t^2)`. When the groups fit into complementary binary subspaces
-(`sum ceil(log2(group_data + 1)) <= 8`), it uses that deterministic packing
-first. It then tries a deterministic 4-dimensional spread packing, which covers
-up to 17 groups with at most 15 data symbols per group. Equivalently, if `r`
-denotes the local-group size including the one local parity symbol, this
-deterministic spread path requires `r <= 16`. If both deterministic paths do
-not apply, it falls back to randomized difference packing over GF(256), where
-the implementation only accepts groups with `group_data + 1 <= 256` but offers
-no comparable deterministic size guarantee. In the deterministic spread case,
-examples such as `LRC(64,8,2)` are constructed directly instead of found by
-random search. Legacy boolean values are accepted as aliases (`true` = `1`,
-`false` = `0`). The
-experimental all-symbol skew-polynomial prototype is isolated in
+## H=2 Difference-Pack Construction
+
+`--construction N` tries up to `N` registered constructive candidates before
+the generic random search path. For h=2 data-local LRCs, use
+`--construction 10000`; deterministic cases usually finish on attempt 1, while
+the larger value gives the randomized fallback useful room.
+
+Value semantics:
+
+| Value | Meaning |
+| --- | --- |
+| `0` | Disable construction. This is the default. |
+| `N > 0` | Try up to `N` h=2 difference-pack construction attempts before generic random search. |
+| `true`, `on`, `yes` | Compatibility aliases for `1`. |
+| `false`, `off`, `no` | Compatibility aliases for `0`. |
+
+Basic requirements for `difference_pack_h2`:
+
+| Requirement | Value |
+| --- | --- |
+| Field | GF(256) |
+| `--global-parity` | Exactly `2` |
+| `--local-parity` | Exactly `1` per group |
+| Per-group data symbols | `group_data + 1 <= 256` |
+| Matrix shape | Local row is all `1`; global rows are `(t, t^2)` |
+| Success marker | Output contains `candidate_source=difference_pack_h2` |
+
+Construction paths:
+
+| Path | Applies when | Guarantee |
+| --- | --- | --- |
+| Complementary subspaces | `sum ceil(log2(group_data + 1)) <= 8` | Deterministic packing. |
+| 4-dimensional spread | `groups <= 17` and `group_data <= 15` | Deterministic packing. If `r` means local-group size including the one local parity symbol, this is `r <= 16`. |
+| Randomized difference packing | Basic requirements hold, but deterministic paths do not apply | Consumes the `--construction` attempt budget; no deterministic size guarantee. |
+
+At the spread limit, the largest evenly split data-local case is:
+
+```text
+groups = 17
+group_data = 15
+data = 255
+symbols = 255 + 17 local parity + 2 global parity = 274
+data / symbols = 255 / 274 ~= 93.07%
+```
+
+Example:
+
+```bash
+./build/mr-lrc-generator \
+  --data 64 \
+  --groups 8 \
+  --local-parity 1 \
+  --global-parity 2 \
+  --construction 10000 \
+  --random-limit 1 \
+  --step-time 0
+```
+
+For the `data=255` edge, the default `--global-method cauchy` is rejected by
+the generic method validator because `data + global_parity > 256`; use
+`--global-method random` with the h=2 construction:
+
+```bash
+./build/mr-lrc-generator \
+  --data 255 \
+  --groups 17 \
+  --local-parity 1 \
+  --global-parity 2 \
+  --global-method random \
+  --construction 10000 \
+  --random-limit 1 \
+  --step-time 0
+```
+
+The experimental all-symbol skew-polynomial prototype is isolated in
 `src/all_symbol_skew_lrc.cpp` and is not part of the build.
 
 ## Construction Methods
@@ -228,7 +271,7 @@ group.
 
 ## Scale Notes
 
-- For `local_parity=1` and `global_parity=2`, prefer `--construction 1`.
+- For `local_parity=1` and `global_parity=2`, prefer `--construction 10000`.
   This path has deterministic coverage for complementary binary subspaces and
   for the 4-dimensional spread case with up to 17 groups and local-group size
   `r <= 16` (`group_data <= 15`), so wide data-local `LRC(k,l,2)` layouts such
@@ -285,13 +328,13 @@ Representative smoke-test cases:
 | `azure_lrc_6_2_2` | `LRC(6,2,2)` | `--data 6 --groups 2 --local-parity 1 --global-parity 2` |
 | `azure_lrc_8_2_2` | `LRC(8,2,2)` | `--data 8 --groups 2 --local-parity 1 --global-parity 2` |
 | `azure_lrc_12_4_2` | `LRC(12,4,2)` | `--data 12 --groups 4 --local-parity 1 --global-parity 2` |
-| `h2_subspace_28_2_2` | `LRC(28,2,2)` | `--data 28 --groups 2 --local-parity 1 --global-parity 2 --construction 1` |
-| `h2_spread_64_8_2` | `LRC(64,8,2)` | `--data 64 --groups 8 --local-parity 1 --global-parity 2 --construction 1` |
+| `h2_subspace_28_2_2` | `LRC(28,2,2)` | `--data 28 --groups 2 --local-parity 1 --global-parity 2 --construction 10000` |
+| `h2_spread_64_8_2` | `LRC(64,8,2)` | `--data 64 --groups 8 --local-parity 1 --global-parity 2 --construction 10000` |
 | `storage_spaces_8_2_1` | `LRC(8,2,1)` | `--data 8 --groups 2 --local-parity 1 --global-parity 1` |
 | `mr_2_6_2_2` | `(g,r,a,h) = (2,6,2,2)` | `--data 6 --groups 2 --local-parity 2 --global-parity 2` |
 | `mr_3_6_2_2` | `(g,r,a,h) = (3,6,2,2)` | `--data 10 --groups 3 --local-parity 2 --global-parity 2` |
 
-Larger `h=2` data-local LRCs should use `--construction 1`; larger generic
+Larger h=2 data-local LRCs should use `--construction 10000`; larger generic
 searches may require a higher `--random-limit`, and the number of enumerated
 checks can still grow quickly with larger `global_parity` values.
 
