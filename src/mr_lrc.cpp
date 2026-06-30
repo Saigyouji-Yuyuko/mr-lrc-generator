@@ -410,8 +410,8 @@ Code make_empty_code(const Params &params)
     if (params.global_parity < 0) {
         throw ValidationError("--global-parity must be non-negative");
     }
-    if (params.random_limit == 0) {
-        throw ValidationError("--random-limit must be positive");
+    if (params.random_limit == 0 && params.construction == 0) {
+        throw ValidationError("--random-limit must be positive unless --construction is enabled");
     }
     if (params.thread_count == 0) {
         throw ValidationError("--thread-count must be positive");
@@ -833,6 +833,329 @@ bool build_difference_pack_h2_candidate(Code *code, Rng &rng, uint64_t *delta_ch
             int data_col = group.data[local_col];
             code->matrix[idx(first_global, data_col, code->data)] = label;
             code->matrix[idx(first_global + 1, data_col, code->data)] = gf256_mul(label, label);
+        }
+    }
+
+    return true;
+}
+
+using H3Point = std::array<uint8_t, 3>;
+
+constexpr uint64_t kH3PointProbesPerSlot = 20000;
+constexpr std::size_t kH3ChoiceLimit = 8;
+
+struct H3GroupSignature {
+    std::vector<H3Point> vectors;
+    std::array<std::array<uint8_t, 256>, 3> projections{};
+    std::vector<H3Point> normals;
+};
+
+bool supports_feasible_points_h3(const Code &code)
+{
+    if (code.global_parity != 3 || code.groups.empty()) {
+        return false;
+    }
+    for (const auto &group : code.groups) {
+        if (group.local_parity != 1 || group.data.empty() || group.data.size() + 1 > 256) {
+            return false;
+        }
+    }
+    return true;
+}
+
+H3Point h3_add(H3Point left, H3Point right)
+{
+    return {static_cast<uint8_t>(left[0] ^ right[0]),
+            static_cast<uint8_t>(left[1] ^ right[1]),
+            static_cast<uint8_t>(left[2] ^ right[2])};
+}
+
+bool h3_all_nonzero(H3Point point)
+{
+    return point[0] != 0 && point[1] != 0 && point[2] != 0;
+}
+
+H3Point h3_cross(H3Point left, H3Point right)
+{
+    return {static_cast<uint8_t>(gf256_mul(left[1], right[2]) ^
+                                 gf256_mul(left[2], right[1])),
+            static_cast<uint8_t>(gf256_mul(left[2], right[0]) ^
+                                 gf256_mul(left[0], right[2])),
+            static_cast<uint8_t>(gf256_mul(left[0], right[1]) ^
+                                 gf256_mul(left[1], right[0]))};
+}
+
+uint8_t h3_dot(H3Point left, H3Point right)
+{
+    return static_cast<uint8_t>(gf256_mul(left[0], right[0]) ^
+                                gf256_mul(left[1], right[1]) ^
+                                gf256_mul(left[2], right[2]));
+}
+
+uint8_t h3_det(H3Point left, H3Point middle, H3Point right)
+{
+    return h3_dot(h3_cross(left, middle), right);
+}
+
+uint8_t h3_projection_signature(H3Point vector, int projection)
+{
+    switch (projection) {
+    case 0:
+        return gf256_mul(vector[1], gf256_inv(vector[0]));
+    case 1:
+        return gf256_mul(vector[2], gf256_inv(vector[0]));
+    default:
+        return gf256_mul(vector[2], gf256_inv(vector[1]));
+    }
+}
+
+bool h3_local_point_ok(const std::vector<H3Point> &points, H3Point point)
+{
+    if (!h3_all_nonzero(point)) {
+        return false;
+    }
+    for (H3Point existing : points) {
+        if (existing == point || !h3_all_nonzero(h3_add(point, existing))) {
+            return false;
+        }
+    }
+
+    for (std::size_t left = 0; left < points.size(); left++) {
+        for (std::size_t right = left + 1; right < points.size(); right++) {
+            H3Point normal = h3_cross(h3_add(point, points[left]), h3_add(point, points[right]));
+            if (normal == H3Point{0, 0, 0} || !h3_all_nonzero(normal)) {
+                return false;
+            }
+        }
+    }
+
+    for (std::size_t first = 0; first < points.size(); first++) {
+        for (std::size_t second = first + 1; second < points.size(); second++) {
+            for (std::size_t third = second + 1; third < points.size(); third++) {
+                if (h3_det(h3_add(point, points[first]), h3_add(point, points[second]),
+                           h3_add(point, points[third])) == 0) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+bool h3_build_group_signature(const std::vector<H3Point> &points, H3GroupSignature *signature)
+{
+    if (signature == nullptr) {
+        return false;
+    }
+
+    signature->vectors.clear();
+    signature->normals.clear();
+    for (auto &projection : signature->projections) {
+        projection.fill(0);
+    }
+
+    for (std::size_t left = 0; left < points.size(); left++) {
+        for (std::size_t right = left + 1; right < points.size(); right++) {
+            H3Point vector = h3_add(points[left], points[right]);
+            if (!h3_all_nonzero(vector)) {
+                return false;
+            }
+            signature->vectors.push_back(vector);
+            for (int projection = 0; projection < 3; projection++) {
+                signature->projections[static_cast<std::size_t>(projection)]
+                                      [h3_projection_signature(vector, projection)] = 1;
+            }
+        }
+    }
+
+    for (std::size_t first = 0; first < points.size(); first++) {
+        for (std::size_t second = first + 1; second < points.size(); second++) {
+            for (std::size_t third = second + 1; third < points.size(); third++) {
+                H3Point normal =
+                    h3_cross(h3_add(points[first], points[third]),
+                             h3_add(points[second], points[third]));
+                if (normal == H3Point{0, 0, 0} || !h3_all_nonzero(normal)) {
+                    return false;
+                }
+                signature->normals.push_back(normal);
+            }
+        }
+    }
+
+    return true;
+}
+
+bool h3_projection_sets_intersect(const std::array<uint8_t, 256> &left,
+                                  const std::array<uint8_t, 256> &right)
+{
+    for (std::size_t value = 0; value < left.size(); value++) {
+        if (left[value] != 0 && right[value] != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool h3_pair_groups_ok(const H3GroupSignature &left, const H3GroupSignature &right)
+{
+    for (int projection = 0; projection < 3; projection++) {
+        if (h3_projection_sets_intersect(left.projections[static_cast<std::size_t>(projection)],
+                                         right.projections[static_cast<std::size_t>(projection)])) {
+            return false;
+        }
+    }
+
+    for (H3Point normal : left.normals) {
+        for (H3Point vector : right.vectors) {
+            if (h3_dot(normal, vector) == 0) {
+                return false;
+            }
+        }
+    }
+    for (H3Point normal : right.normals) {
+        for (H3Point vector : left.vectors) {
+            if (h3_dot(normal, vector) == 0) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+bool h3_three_groups_ok(const H3GroupSignature &first, const H3GroupSignature &second,
+                        const H3GroupSignature &third)
+{
+    for (H3Point left : first.vectors) {
+        for (H3Point middle : second.vectors) {
+            H3Point normal = h3_cross(left, middle);
+            if (normal == H3Point{0, 0, 0}) {
+                return false;
+            }
+            for (H3Point right : third.vectors) {
+                if (h3_dot(normal, right) == 0) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool h3_candidate_group_ok(const std::vector<H3GroupSignature> &existing,
+                           const H3GroupSignature &candidate)
+{
+    for (const auto &signature : existing) {
+        if (!h3_pair_groups_ok(signature, candidate)) {
+            return false;
+        }
+    }
+
+    for (std::size_t left = 0; left < existing.size(); left++) {
+        for (std::size_t right = left + 1; right < existing.size(); right++) {
+            if (!h3_three_groups_ok(existing[left], existing[right], candidate)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+H3Point h3_random_point(Rng &rng)
+{
+    return {rng.nonzero_byte(), rng.nonzero_byte(), rng.nonzero_byte()};
+}
+
+bool h3_build_group_points(int point_count, const std::vector<H3GroupSignature> &existing,
+                           Rng &rng, std::vector<H3Point> *points,
+                           H3GroupSignature *signature)
+{
+    if (points == nullptr || signature == nullptr || point_count <= 0) {
+        return false;
+    }
+
+    points->clear();
+    points->push_back({0, 0, 0});
+
+    while (static_cast<int>(points->size()) < point_count) {
+        std::vector<H3Point> choices;
+        choices.reserve(kH3ChoiceLimit);
+        for (uint64_t probe = 0; probe < kH3PointProbesPerSlot; probe++) {
+            H3Point point = h3_random_point(rng);
+            if (!h3_local_point_ok(*points, point)) {
+                continue;
+            }
+
+            std::vector<H3Point> trial = *points;
+            trial.push_back(point);
+            H3GroupSignature trial_signature;
+            if (!h3_build_group_signature(trial, &trial_signature)) {
+                continue;
+            }
+            if (!existing.empty() && !h3_candidate_group_ok(existing, trial_signature)) {
+                continue;
+            }
+
+            choices.push_back(point);
+            if (choices.size() >= kH3ChoiceLimit) {
+                break;
+            }
+        }
+
+        if (choices.empty()) {
+            return false;
+        }
+        points->push_back(choices[static_cast<std::size_t>(rng.range(choices.size()))]);
+    }
+
+    return h3_build_group_signature(*points, signature) &&
+           (existing.empty() || h3_candidate_group_ok(existing, *signature));
+}
+
+bool build_feasible_points_h3_candidate(Code *code, Rng &rng)
+{
+    if (code == nullptr || code->construction == 0 || !supports_feasible_points_h3(*code)) {
+        return false;
+    }
+
+    std::vector<std::vector<H3Point>> group_points(code->groups.size());
+    std::vector<H3GroupSignature> signatures;
+    signatures.reserve(code->groups.size());
+
+    for (std::size_t group_index = 0; group_index < code->groups.size(); group_index++) {
+        const auto &group = code->groups[group_index];
+        H3GroupSignature signature;
+        if (!h3_build_group_points(static_cast<int>(group.data.size()) + 1, signatures, rng,
+                                   &group_points[group_index], &signature)) {
+            return false;
+        }
+        signatures.push_back(std::move(signature));
+    }
+
+    reset_identity(code);
+    code->local_mds_guaranteed = true;
+    code->candidate_source = "feasible_points_h3";
+
+    for (std::size_t group_index = 0; group_index < code->groups.size(); group_index++) {
+        const auto &group = code->groups[group_index];
+        for (int data_col : group.data) {
+            code->matrix[idx(group.local_row_start, data_col, code->data)] = 1;
+        }
+    }
+
+    int first_global = code->data + code->local_rows;
+    for (std::size_t group_index = 0; group_index < code->groups.size(); group_index++) {
+        const auto &group = code->groups[group_index];
+        const auto &points = group_points[group_index];
+        for (std::size_t local_col = 0; local_col < group.data.size(); local_col++) {
+            int data_col = group.data[local_col];
+            H3Point point = points[local_col + 1];
+            for (int row = 0; row < code->global_parity; row++) {
+                code->matrix[idx(first_global + row, data_col, code->data)] =
+                    point[static_cast<std::size_t>(row)];
+            }
         }
     }
 
@@ -4818,6 +5141,79 @@ GenerateResult generate(const Params &params)
             std::atomic<uint64_t> prefilter_rejected_candidates{0};
             std::atomic<uint64_t> prefilter_patterns_checked{0};
         };
+
+        if (params.construction != 0 && supports_feasible_points_h3(base_code)) {
+            uint64_t checked_candidates = 0;
+            uint64_t strict_candidates = 0;
+            uint64_t total_patterns_checked = 0;
+            uint64_t failed_candidates = 0;
+            bool first_failure_recorded = false;
+            Code first_failure_code;
+            CheckResult first_failure_check;
+
+            for (uint64_t attempt = 1; attempt <= params.construction; attempt++) {
+                Code constructed = base_code;
+                constructed.attempt = attempt;
+                Rng rng(seed_for_attempt(params.seed, attempt));
+                if (!build_feasible_points_h3_candidate(&constructed, rng)) {
+                    continue;
+                }
+
+                checked_candidates++;
+                CheckResult check = check_mr(constructed);
+                constructed.patterns_checked = check.patterns_checked;
+                total_patterns_checked += check.patterns_checked;
+                if (check.strict_complete) {
+                    strict_candidates++;
+                }
+
+                if (check.is_mr) {
+                    result.status = 0;
+                    result.message = "MR-LRC matrix found by feasible-points h=3 construction";
+                    result.code = std::move(constructed);
+                    result.check = std::move(check);
+                    result.attempts_done = attempt;
+                    result.unique_candidates_checked = checked_candidates;
+                    result.strict_candidates_checked = strict_candidates;
+                    return result;
+                }
+
+                failed_candidates++;
+                if (!first_failure_recorded) {
+                    first_failure_code = constructed;
+                    first_failure_check = std::move(check);
+                    first_failure_recorded = true;
+                }
+            }
+
+            if (params.random_limit == 0) {
+                result.status = 2;
+                result.message = "no MR-LRC matrix found after " +
+                                 std::to_string(params.construction) +
+                                 " h=3 construction attempts";
+                result.attempts_done = params.construction;
+                result.unique_candidates_checked = checked_candidates;
+                result.strict_candidates_checked = strict_candidates;
+                result.check.patterns_checked = total_patterns_checked;
+                result.check.failures = failed_candidates;
+                if (first_failure_recorded) {
+                    result.code = std::move(first_failure_code);
+                    result.check = std::move(first_failure_check);
+                    result.check.patterns_checked = total_patterns_checked;
+                    result.check.failures = failed_candidates;
+                }
+                return result;
+            }
+        }
+
+        if (params.random_limit == 0) {
+            result.status = 2;
+            result.message = "no MR-LRC matrix found after " +
+                             std::to_string(params.construction) +
+                             " construction attempts";
+            result.attempts_done = params.construction;
+            return result;
+        }
 
         constexpr uint64_t kStatsPublishInterval = 64;
         uint64_t worker_count = std::min(params.thread_count, params.random_limit);

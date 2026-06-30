@@ -31,7 +31,8 @@ and verifies recoverability over GF(256).
   generated and printed.
 - Search bound via `--random-limit`.
 - Parallel search via `--thread-count`.
-- Dedicated `h=2` difference-pack construction for large data-local LRCs.
+- Dedicated `h=2` difference-pack construction for large data-local LRCs, plus
+  an experimental `h=3` feasible-points construction for small GF(256) cases.
 - Optional stress-test prefilter before exact verification.
 - Exact verification of a matrix supplied in JSON.
 - ISA-L-backed GF(256) arithmetic.
@@ -118,7 +119,7 @@ Optional parameters:
 | `--local-method M` | Local parity construction: `cauchy`, `vandermonde`, or `random`. |
 | `--global-method M` | Global parity construction: `cauchy`, `column_multiplier_cauchy`, `vandermonde`, or `random`. |
 | `-m`, `--method M` | Alias that sets both local and global methods. |
-| `--construction N` | h=2 difference-pack construction attempt budget before random search. Default: `0` disables construction; recommended h=2 value: `10000`. |
+| `--construction N` | Registered construction attempt budget before random search. Default: `0` disables construction. Current paths cover h=2 difference-pack and experimental h=3 feasible-points candidates. |
 | `--random-limit N` | Maximum candidate attempts. Default: unbounded `uint64` max. |
 | `--prefilter-count N`, `--random-prefilter N`, `--stress-prefilter N` | Stress-test patterns to run before exact verification for each candidate. Default: `0` disables the prefilter. |
 | `-t`, `--thread-count N` | Parallel search worker count. Default: `1`, max: `256`. |
@@ -140,7 +141,7 @@ Value semantics:
 | Value | Meaning |
 | --- | --- |
 | `0` | Disable construction. This is the default. |
-| `N > 0` | Try up to `N` h=2 difference-pack construction attempts before generic random search. |
+| `N > 0` | Try up to `N` registered construction attempts before generic random search. |
 | `true`, `on`, `yes` | Compatibility aliases for `1`. |
 | `false`, `off`, `no` | Compatibility aliases for `0`. |
 
@@ -204,6 +205,60 @@ the generic method validator because `data + global_parity > 256`; use
 
 The experimental all-symbol skew-polynomial prototype is isolated in
 `src/all_symbol_skew_lrc.cpp` and is not part of the build.
+
+## H=3 Feasible-Points Construction
+
+For data-local `local_parity=1`, `global_parity=3`, `--construction N` also
+enables an experimental GF(256)^3 feasible-points construction before generic
+random search. It builds each local group as a point set with the local parity
+at the origin, filters residual vector/plane compatibility across groups, and
+then runs the exact MR checker. This is a heuristic candidate generator, not a
+proof shortcut; the exact checker remains the authority.
+
+Basic requirements for `feasible_points_h3`:
+
+| Requirement | Value |
+| --- | --- |
+| Field | GF(256) |
+| `--global-parity` | Exactly `3` |
+| `--local-parity` | Exactly `1` per group |
+| Matrix shape | Local row is all `1`; global rows are 3D point coordinates |
+| Success marker | Output contains `candidate_source=feasible_points_h3` |
+
+Observed status from the current experiments:
+
+| Status | Parameters |
+| --- | --- |
+| Exact-verified by the construction/search experiments | `LRC(12,2,3)`, `LRC(14,2,3)`, `LRC(16,2,3)`, `LRC(12,4,3)`, `LRC(16,3,3)`, `LRC(16,4,3)` |
+| Not found by the current construction/search experiments | `LRC(18,2,3)`, `LRC(18,3,3)`, `LRC(20,4,3)` |
+
+Example:
+
+```bash
+./build/mr-lrc-generator \
+  --data 16 \
+  --groups 4 \
+  --local-parity 1 \
+  --global-parity 3 \
+  --construction 100 \
+  --random-limit 0 \
+  --local-method random \
+  --global-method random \
+  --step-time 0
+```
+
+## H=4 Experimental Status
+
+No h=4 construction path is registered in the generator yet.
+`global_parity=4` should be treated as experimental. Small cases such as
+`LRC(8,2,4)` and `LRC(10,2,4)` are useful baselines, but the current GF(256)^4
+point-set experiments, h=3 lifting attempts, and GF(16)/Moore-style probes have
+not found `LRC(12,2,4)`, `LRC(12,3,4)`, `LRC(12,4,4)`, or `LRC(14,2,4)`.
+
+The observed bottleneck is cross-group residual-subspace packing, especially
+fourth-group triple compatibility, rather than constructing valid individual
+local groups. Treat any larger h=4 run as research work until a dedicated
+CSP/hypergraph construction is added and exact-verified.
 
 ## Construction Methods
 
@@ -276,11 +331,15 @@ group.
   for the 4-dimensional spread case with up to 17 groups and local-group size
   `r <= 16` (`group_data <= 15`), so wide data-local `LRC(k,l,2)` layouts such
   as `LRC(64,8,2)` are practical.
+- For `local_parity=1` and `global_parity=3`, `--construction` enables the
+  experimental feasible-points path. Current experiments support small GF(256)
+  layouts up to the tested `k=16` cases, with the exact checker still required
+  for every accepted matrix.
 - The generic search/check path still becomes expensive as `global_parity`
-  grows. For `global_parity >= 3`, use small parameters first and consider
-  `--prefilter-count`.
-- Using `global_parity >= 4` remains experimental and is not recommended for
-  large layouts.
+  grows. For unconstructed or larger `global_parity >= 3` parameters, use small
+  parameters first and consider `--prefilter-count`.
+- No h=4 construction is currently registered. `global_parity >= 4` remains
+  experimental and is not recommended for large layouts.
 
 ## Verification Model
 
@@ -330,13 +389,17 @@ Representative smoke-test cases:
 | `azure_lrc_12_4_2` | `LRC(12,4,2)` | `--data 12 --groups 4 --local-parity 1 --global-parity 2` |
 | `h2_subspace_28_2_2` | `LRC(28,2,2)` | `--data 28 --groups 2 --local-parity 1 --global-parity 2 --construction 10000` |
 | `h2_spread_64_8_2` | `LRC(64,8,2)` | `--data 64 --groups 8 --local-parity 1 --global-parity 2 --construction 10000` |
+| `h3_points_12_4_3` | `LRC(12,4,3)` | `--data 12 --groups 4 --local-parity 1 --global-parity 3 --construction 1 --random-limit 0 --local-method random --global-method random` |
+| `h3_points_16_4_3` | `LRC(16,4,3)` | `--data 16 --groups 4 --local-parity 1 --global-parity 3 --construction 100 --random-limit 0 --local-method random --global-method random` |
 | `storage_spaces_8_2_1` | `LRC(8,2,1)` | `--data 8 --groups 2 --local-parity 1 --global-parity 1` |
 | `mr_2_6_2_2` | `(g,r,a,h) = (2,6,2,2)` | `--data 6 --groups 2 --local-parity 2 --global-parity 2` |
 | `mr_3_6_2_2` | `(g,r,a,h) = (3,6,2,2)` | `--data 10 --groups 3 --local-parity 2 --global-parity 2` |
 
 Larger h=2 data-local LRCs should use `--construction 10000`; larger generic
 searches may require a higher `--random-limit`, and the number of enumerated
-checks can still grow quickly with larger `global_parity` values.
+checks can still grow quickly with larger `global_parity` values. For h=3 and
+h=4, keep the status notes above as the current boundary of what has been
+observed.
 
 ## Test
 
