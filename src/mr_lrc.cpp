@@ -839,6 +839,74 @@ bool build_difference_pack_h2_candidate(Code *code, Rng &rng, uint64_t *delta_ch
     return true;
 }
 
+CheckResult check_difference_pack_h2_proof(const Code &code)
+{
+    CheckResult result;
+    if (!supports_difference_pack_h2(code) ||
+        code.matrix.size() !=
+            static_cast<std::size_t>(code.symbols) * static_cast<std::size_t>(code.data)) {
+        result.message = "candidate does not match h=2 difference-pack requirements";
+        result.failures = 1;
+        return result;
+    }
+
+    for (int row = 0; row < code.data; row++) {
+        for (int col = 0; col < code.data; col++) {
+            uint8_t expected = row == col ? 1 : 0;
+            if (code.matrix[idx(row, col, code.data)] != expected) {
+                result.message = "candidate data rows are not identity";
+                result.failures = 1;
+                return result;
+            }
+        }
+    }
+
+    std::array<uint8_t, 256> used_deltas{};
+    uint64_t delta_checks = 0;
+    int first_global = code.data + code.local_rows;
+    for (const auto &group : code.groups) {
+        std::vector<uint8_t> labels;
+        labels.reserve(group.data.size() + 1);
+        labels.push_back(0);
+
+        for (int col = 0; col < code.data; col++) {
+            bool in_group =
+                std::find(group.data.begin(), group.data.end(), col) != group.data.end();
+            uint8_t expected = in_group ? 1 : 0;
+            if (code.matrix[idx(group.local_row_start, col, code.data)] != expected) {
+                result.message = "candidate local row does not match h=2 construction shape";
+                result.failures = 1;
+                return result;
+            }
+        }
+
+        for (int data_col : group.data) {
+            uint8_t label = code.matrix[idx(first_global, data_col, code.data)];
+            uint8_t square = code.matrix[idx(first_global + 1, data_col, code.data)];
+            if (square != gf256_mul(label, label)) {
+                result.message = "candidate global rows do not have (t, t^2) shape";
+                result.failures = 1;
+                return result;
+            }
+            labels.push_back(label);
+        }
+
+        if (!mark_group_deltas(labels, &used_deltas, &delta_checks)) {
+            result.message = "candidate h=2 difference sets collide";
+            result.failures = 1;
+            return result;
+        }
+    }
+
+    result.is_mr = true;
+    result.strict_complete = false;
+    result.patterns_checked = 0;
+    result.message = "candidate accepted by difference-pack h=2 construction proof after " +
+                     std::to_string(delta_checks) +
+                     " delta checks; exact erasure verifier was not run";
+    return result;
+}
+
 using H3Point = std::array<uint8_t, 3>;
 
 constexpr uint64_t kH3PointProbesPerSlot = 20000;
@@ -5094,17 +5162,14 @@ GenerateResult generate(const Params &params)
                 Code constructed = base_code;
                 constructed.attempt = attempt;
                 Rng rng(seed_for_attempt(params.seed, attempt));
-                uint64_t delta_checks = 0;
-                if (!build_difference_pack_h2_candidate(&constructed, rng, &delta_checks)) {
+                if (!build_difference_pack_h2_candidate(&constructed, rng, nullptr)) {
                     continue;
                 }
 
-                CheckResult check;
-                check.is_mr = true;
-                check.strict_complete = true;
-                check.patterns_checked = delta_checks;
-                check.message =
-                    "candidate accepted by difference-pack h=2 construction proof";
+                CheckResult check = check_difference_pack_h2_proof(constructed);
+                if (!check.is_mr) {
+                    throw ValidationError(check.message);
+                }
 
                 result.status = 0;
                 result.message =
@@ -5113,7 +5178,7 @@ GenerateResult generate(const Params &params)
                 result.check = std::move(check);
                 result.attempts_done = attempt;
                 result.unique_candidates_checked = 1;
-                result.strict_candidates_checked = 1;
+                result.strict_candidates_checked = 0;
                 return result;
             }
         }

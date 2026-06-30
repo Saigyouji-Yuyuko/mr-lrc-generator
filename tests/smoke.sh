@@ -127,18 +127,23 @@ run_case "construction_disabled_6_2_2" -k 6 -g 2 -r 1 -p 2 -s 1 --construction 0
 run_case "difference_pack_h2_subspace_28_2_2" -k 28 -g 2 -r 1 -p 2 -s 1 --construction 1 --random-limit 1 --step-time 0
 expect_log_text "candidate_source=difference_pack_h2"
 expect_log_text "attempt=1"
+expect_log_text "strict_complete=false"
 run_case "difference_pack_h2_spread_32_4_2" -k 32 -g 4 -r 1 -p 2 -s 1 --construction 1 --random-limit 1 --step-time 0
 expect_log_text "candidate_source=difference_pack_h2"
 expect_log_text "attempt=1"
+expect_log_text "strict_complete=false"
 run_case "difference_pack_h2_spread_48_4_2" -k 48 -g 4 -r 1 -p 2 -s 1 --construction 1 --random-limit 1 --step-time 0
 expect_log_text "candidate_source=difference_pack_h2"
 expect_log_text "attempt=1"
+expect_log_text "strict_complete=false"
 run_case "difference_pack_h2_spread_64_8_2" -k 64 -g 8 -r 1 -p 2 -s 1 --construction 1 --random-limit 1 --step-time 0
 expect_log_text "candidate_source=difference_pack_h2"
 expect_log_text "attempt=1"
+expect_log_text "strict_complete=false"
 run_case "feasible_points_h3_12_4_3" -k 12 -g 4 -r 1 -p 3 -s 100 --construction 1 --random-limit 0 --step-time 0 --local-method random --global-method random
 expect_log_text "candidate_source=feasible_points_h3"
 expect_log_text "attempt=1"
+expect_log_text "strict_complete=true"
 
 # Industrial data-local LRC(k,l,h) style candidates. These use one local
 # parity per local group, so l maps to --groups and h maps to --global-parity.

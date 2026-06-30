@@ -488,6 +488,8 @@ void print_matrix_json(std::ostream &out, const mrlrc::GenerateResult &result,
     out << "  \"thread_count\": " << params.thread_count << ",\n";
     out << "  \"attempt\": " << code.attempt << ",\n";
     out << "  \"patterns_checked\": " << result.check.patterns_checked << ",\n";
+    out << "  \"strict_complete\": "
+        << (result.check.strict_complete ? "true" : "false") << ",\n";
     if (result.prefilter_enabled) {
         out << "  \"prefilter_count\": " << params.prefilter_count << ",\n";
         out << "  \"prefilter_candidates_checked\": "
@@ -1288,6 +1290,8 @@ int main(int argc, char **argv)
         print_attribute("thread_count", opts.params.thread_count);
         print_attribute("attempt", code.attempt);
         print_attribute("patterns_checked", result.check.patterns_checked);
+        print_attribute("strict_complete",
+                        result.check.strict_complete ? "true" : "false");
         print_prefilter_stats(result, opts.params.prefilter_count);
         if (result.cauchy_dedup_enabled) {
             print_attribute("cauchy_dedup", "on");

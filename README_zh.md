@@ -130,6 +130,11 @@ local 和 global parity row 可以使用不同构造方法：
 data-local LRC，建议使用 `--construction 10000`；确定性覆盖到的参数通常第 1 次就能
 完成，较大的数值则给随机回退路径留下足够尝试空间。
 
+h=2 构造成功时，`generate()` 按 difference-pack 构造证明接受该矩阵，不会再跑精确
+擦除枚举 verifier。因此输出会标成 `strict_complete=false` 且
+`patterns_checked=0`。如果某个 h=2 小参数需要显式精确校验，可以把矩阵写成 JSON
+后用 `--check-json` 再验一遍。
+
 取值语义：
 
 | 取值 | 含义 |

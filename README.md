@@ -136,6 +136,12 @@ the generic random search path. For h=2 data-local LRCs, use
 `--construction 10000`; deterministic cases usually finish on attempt 1, while
 the larger value gives the randomized fallback useful room.
 
+h=2 construction successes are accepted by the difference-pack construction
+proof and do not run the exact erasure verifier in `generate()`. Their output
+therefore reports `strict_complete=false` and `patterns_checked=0`. Use
+`--check-json` on the emitted matrix when you want an explicit exact verifier
+run for a small enough h=2 instance.
+
 Value semantics:
 
 | Value | Meaning |
