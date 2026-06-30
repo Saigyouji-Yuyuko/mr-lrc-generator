@@ -26,7 +26,7 @@ struct Params {
     uint64_t thread_count = 1;
     MatrixFamily local_family = MatrixFamily::Cauchy;
     MatrixFamily global_family = MatrixFamily::Cauchy;
-    bool construction = true;
+    uint64_t construction = 0;
     bool cauchy_dedup = false;
     uint64_t prefilter_count = 0;
     uint64_t step_time = 0;
@@ -50,7 +50,8 @@ struct Code {
     uint64_t patterns_checked = 0;
     MatrixFamily local_family = MatrixFamily::Cauchy;
     MatrixFamily global_family = MatrixFamily::Cauchy;
-    bool construction = true;
+    uint64_t construction = 0;
+    bool local_mds_guaranteed = false;
     std::string candidate_source = "search";
     std::vector<LocalGroup> groups;
     std::vector<uint8_t> matrix;
@@ -86,6 +87,7 @@ const char *family_name(MatrixFamily family);
 bool parse_family(const std::string &name, MatrixFamily *family);
 
 GenerateResult generate(const Params &params);
+Code make_code_layout(const Params &params);
 CheckResult check_mr(const Code &code);
 std::string symbol_label(const Code &code, int symbol);
 std::vector<int> erased_symbols_from_mask(const Code &code, const std::vector<uint8_t> &erased);

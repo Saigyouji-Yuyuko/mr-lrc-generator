@@ -32,6 +32,7 @@ and verifies recoverability over GF(256).
 - Search bound via `--random-limit`.
 - Parallel search via `--thread-count`.
 - Optional stress-test prefilter before exact verification.
+- Exact verification of a matrix supplied in JSON.
 - ISA-L-backed GF(256) arithmetic.
 
 ## Build
@@ -63,7 +64,7 @@ rows:
   --local-parity 1 \
   --global-parity 2 \
   --seed 1 \
-  --construction false \
+  --construction 0 \
   --local-method cauchy \
   --global-method cauchy
 ```
@@ -77,7 +78,7 @@ You can choose different construction methods for local and global parity rows:
   --local-parity 1 \
   --global-parity 2 \
   --seed 1 \
-  --construction false \
+  --construction 0 \
   --local-method random \
   --global-method cauchy \
   --random-limit 100 \
@@ -113,20 +114,29 @@ Optional parameters:
 | `--local-method M` | Local parity construction: `cauchy`, `vandermonde`, or `random`. |
 | `--global-method M` | Global parity construction: `cauchy`, `column_multiplier_cauchy`, `vandermonde`, or `random`. |
 | `-m`, `--method M` | Alias that sets both local and global methods. |
-| `--construction BOOL` | Enable registered data-local constructions. Default: `true`. |
+| `--construction N` | Difference-pack construction attempts before random search. Default: `0` disables construction. |
 | `--random-limit N` | Maximum candidate attempts. Default: unbounded `uint64` max. |
 | `--prefilter-count N`, `--random-prefilter N`, `--stress-prefilter N` | Stress-test patterns to run before exact verification for each candidate. Default: `0` disables the prefilter. |
 | `-t`, `--thread-count N` | Parallel search worker count. Default: `1`, max: `256`. |
 | `--step_time N`, `--step-time N` | Print timestamped searched and strict-complete counts to stderr every N seconds. Default: `30`; `0` disables it. |
 | `--json FILE`, `--matrix-json FILE` | Write the found result as pretty JSON to `FILE`, including stdout metadata, local groups, and decimal/hex matrices. Standard output keeps the normal text report. |
+| `--check-json FILE`, `--verify-json FILE`, `--input-json FILE` | Read a matrix JSON file and exactly verify whether it is MR-LRC. Search parameters are not required in this mode. |
 | `--cauchy-dedup` | Skip duplicate all-Cauchy candidates using canonical Cauchy parameter keys. Default: disabled. |
 | `-h`, `--help` | Print CLI help. |
 
-`--construction` accepts `true/false`, `on/off`, `1/0`, and `yes/no`. The
-current data-local flow does not register a closed-form construction, so the
-main path falls back to random candidate search. The experimental all-symbol
-skew-polynomial prototype is isolated in `src/all_symbol_skew_lrc.cpp` and is
-not part of the build.
+`--construction N` tries up to `N` registered data-local construction attempts
+before random candidate search; `0` disables construction. The first registered
+construction is `difference_pack_h2`, a GF(256) data-local construction for
+`local_parity=1` and `global_parity=2`. It picks per-group labels whose pairwise
+xor difference sets are disjoint, uses unit local rows, and sets global rows to
+`(t, t^2)`. When the groups fit into complementary binary subspaces
+(`sum ceil(log2(group_data + 1)) <= 8`), it uses that deterministic packing
+first. It then tries a deterministic 4-dimensional spread packing, which covers
+up to 17 groups with at most 15 data symbols per group. If both deterministic
+paths do not apply, it falls back to randomized difference packing. Legacy
+boolean values are accepted as aliases (`true` = `1`, `false` = `0`). The
+experimental all-symbol skew-polynomial prototype is isolated in
+`src/all_symbol_skew_lrc.cpp` and is not part of the build.
 
 ## Construction Methods
 
@@ -153,6 +163,44 @@ candidate is accepted.
 Local and global methods are independent. For example, `--local-method random
 --global-method column_multiplier_cauchy` creates nonzero random local parity
 rows and column-scaled Cauchy global parity rows.
+
+## Checking a JSON Matrix
+
+Use `--check-json FILE` to verify an existing systematic data-local generator
+matrix without running the random search:
+
+```bash
+./build/mr-lrc-generator --check-json matrix.json
+```
+
+The command exits with status `0` when the matrix is MR-LRC and `2` when it is
+not. The JSON written by `--json` can be fed back directly. A minimal input can
+also use the compatibility field names below:
+
+```json
+{
+  "data_cnt": 4,
+  "group_cnt": 2,
+  "local_parity_cnt": 1,
+  "global_parity_cnt": 1,
+  "matrix": [
+    [1, 0, 0, 0],
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+    [0, 0, 0, 1],
+    [1, 1, 0, 0],
+    [0, 0, 1, 1],
+    [1, 2, 3, 4]
+  ]
+}
+```
+
+`matrix` entries are decimal GF(256) bytes in `0..255`. Alternatively,
+`matrix_hex` may be used with hex strings such as `"0a"`. If a `groups` array
+is present, its `data` layout is honored; otherwise data symbols are split
+evenly across groups, matching the generator. The verifier requires identity
+data rows and local parity rows that only touch data symbols in their own
+group.
 
 ## Scale Notes
 

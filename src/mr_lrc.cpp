@@ -12,14 +12,14 @@
 #include <exception>
 #include <cstring>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -493,11 +493,350 @@ void build_global_rows(Code *code, Rng &rng, CauchyKeyBytes *cauchy_key)
 void build_candidate(Code *code, Rng &rng, CauchyKeyBytes *cauchy_key)
 {
     reset_identity(code);
+    code->local_mds_guaranteed = code->local_family == MatrixFamily::Cauchy;
     if (cauchy_key != nullptr) {
         cauchy_key->clear();
     }
     build_local_rows(code, rng, cauchy_key);
     build_global_rows(code, rng, cauchy_key);
+}
+
+bool supports_difference_pack_h2(const Code &code)
+{
+    if (code.global_parity != 2 || code.groups.empty()) {
+        return false;
+    }
+    for (const auto &group : code.groups) {
+        if (group.local_parity != 1 || group.data.size() + 1 > 256) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool value_is_in_labels(const std::vector<uint8_t> &labels, uint8_t value)
+{
+    return std::find(labels.begin(), labels.end(), value) != labels.end();
+}
+
+int ceil_log2_capacity(int count)
+{
+    int dimension = 0;
+    int capacity = 1;
+    while (capacity < count) {
+        capacity <<= 1;
+        dimension++;
+    }
+    return dimension;
+}
+
+bool mark_group_deltas(const std::vector<uint8_t> &labels, std::array<uint8_t, 256> *used_deltas,
+                       uint64_t *delta_checks)
+{
+    if (used_deltas == nullptr) {
+        return false;
+    }
+
+    std::array<uint8_t, 256> group_deltas{};
+    for (std::size_t left = 0; left < labels.size(); left++) {
+        for (std::size_t right = left + 1; right < labels.size(); right++) {
+            uint8_t delta = static_cast<uint8_t>(labels[left] ^ labels[right]);
+            if (delta == 0) {
+                return false;
+            }
+            group_deltas[static_cast<std::size_t>(delta)] = 1;
+        }
+    }
+
+    for (int delta = 1; delta < 256; delta++) {
+        if (group_deltas[static_cast<std::size_t>(delta)] == 0) {
+            continue;
+        }
+        if ((*used_deltas)[static_cast<std::size_t>(delta)] != 0) {
+            return false;
+        }
+        (*used_deltas)[static_cast<std::size_t>(delta)] = 1;
+        if (delta_checks != nullptr) {
+            (*delta_checks)++;
+        }
+    }
+
+    return true;
+}
+
+bool build_difference_pack_subspace_labels(const Code &code,
+                                           std::vector<std::vector<uint8_t>> *group_labels,
+                                           uint64_t *delta_checks)
+{
+    if (group_labels == nullptr || !supports_difference_pack_h2(code)) {
+        return false;
+    }
+
+    int total_dimension = 0;
+    for (const auto &group : code.groups) {
+        total_dimension += ceil_log2_capacity(static_cast<int>(group.data.size()) + 1);
+        if (total_dimension > 8) {
+            return false;
+        }
+    }
+
+    std::array<uint8_t, 256> used_deltas{};
+    group_labels->clear();
+    group_labels->resize(code.groups.size());
+    if (delta_checks != nullptr) {
+        *delta_checks = 0;
+    }
+
+    int bit_offset = 0;
+    for (std::size_t group_index = 0; group_index < code.groups.size(); group_index++) {
+        const auto &group = code.groups[group_index];
+        int needed = static_cast<int>(group.data.size()) + 1;
+        int dimension = ceil_log2_capacity(needed);
+        auto &labels = (*group_labels)[group_index];
+        labels.clear();
+        labels.reserve(static_cast<std::size_t>(needed));
+        labels.push_back(0);
+
+        for (int mask = 1; mask < (1 << dimension) &&
+                           static_cast<int>(labels.size()) < needed;
+             mask++) {
+            uint8_t value = 0;
+            for (int bit = 0; bit < dimension; bit++) {
+                if ((mask & (1 << bit)) != 0) {
+                    value = static_cast<uint8_t>(value ^ (1U << (bit_offset + bit)));
+                }
+            }
+            labels.push_back(value);
+        }
+
+        if (static_cast<int>(labels.size()) != needed ||
+            !mark_group_deltas(labels, &used_deltas, delta_checks)) {
+            return false;
+        }
+        bit_offset += dimension;
+    }
+
+    return true;
+}
+
+uint8_t gf16_mul_nibble(uint8_t left, uint8_t right)
+{
+    uint8_t product = 0;
+    while (right != 0) {
+        if ((right & 1U) != 0) {
+            product = static_cast<uint8_t>(product ^ left);
+        }
+
+        uint8_t carry = static_cast<uint8_t>(left & 0x8U);
+        left = static_cast<uint8_t>((left << 1U) & 0xfU);
+        if (carry != 0) {
+            left = static_cast<uint8_t>(left ^ 0x3U);
+        }
+        right = static_cast<uint8_t>(right >> 1U);
+    }
+    return product;
+}
+
+uint8_t spread_h2_label(int spread_index, int element)
+{
+    uint8_t x = static_cast<uint8_t>(element & 0xf);
+    if (spread_index < 16) {
+        uint8_t y = gf16_mul_nibble(static_cast<uint8_t>(spread_index), x);
+        return static_cast<uint8_t>(x | (y << 4U));
+    }
+    return static_cast<uint8_t>(x << 4U);
+}
+
+bool build_difference_pack_spread_labels(const Code &code,
+                                         std::vector<std::vector<uint8_t>> *group_labels,
+                                         uint64_t *delta_checks)
+{
+    if (group_labels == nullptr || !supports_difference_pack_h2(code) ||
+        code.groups.size() > 17) {
+        return false;
+    }
+
+    for (const auto &group : code.groups) {
+        if (group.data.size() + 1 > 16) {
+            return false;
+        }
+    }
+
+    std::array<uint8_t, 256> used_deltas{};
+    group_labels->clear();
+    group_labels->resize(code.groups.size());
+    if (delta_checks != nullptr) {
+        *delta_checks = 0;
+    }
+
+    for (std::size_t group_index = 0; group_index < code.groups.size(); group_index++) {
+        const auto &group = code.groups[group_index];
+        int needed = static_cast<int>(group.data.size()) + 1;
+        auto &labels = (*group_labels)[group_index];
+        labels.clear();
+        labels.reserve(static_cast<std::size_t>(needed));
+        for (int element = 0; element < needed; element++) {
+            labels.push_back(spread_h2_label(static_cast<int>(group_index), element));
+        }
+
+        if (!mark_group_deltas(labels, &used_deltas, delta_checks)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool build_difference_pack_group(int data_count, const std::array<uint8_t, 256> &used_deltas,
+                                 Rng &rng, std::vector<uint8_t> *labels,
+                                 std::array<uint8_t, 256> *group_deltas)
+{
+    if (labels == nullptr || group_deltas == nullptr || data_count < 0 || data_count > 255) {
+        return false;
+    }
+
+    struct Choice {
+        int growth = 0;
+        uint64_t tie = 0;
+        uint8_t value = 0;
+    };
+
+    labels->clear();
+    labels->push_back(0);
+    group_deltas->fill(0);
+
+    while (static_cast<int>(labels->size()) < data_count + 1) {
+        std::vector<Choice> choices;
+        choices.reserve(255);
+        for (int candidate = 1; candidate < 256; candidate++) {
+            uint8_t value = static_cast<uint8_t>(candidate);
+            if (value_is_in_labels(*labels, value)) {
+                continue;
+            }
+
+            bool ok = true;
+            int growth = 0;
+            std::array<uint8_t, 256> touched{};
+            for (uint8_t existing : *labels) {
+                uint8_t delta = static_cast<uint8_t>(value ^ existing);
+                if (used_deltas[static_cast<std::size_t>(delta)] != 0) {
+                    ok = false;
+                    break;
+                }
+                if ((*group_deltas)[static_cast<std::size_t>(delta)] == 0 &&
+                    touched[static_cast<std::size_t>(delta)] == 0) {
+                    touched[static_cast<std::size_t>(delta)] = 1;
+                    growth++;
+                }
+            }
+            if (ok) {
+                choices.push_back({growth, rng.next(), value});
+            }
+        }
+
+        if (choices.empty()) {
+            return false;
+        }
+
+        std::sort(choices.begin(), choices.end(), [](const Choice &left, const Choice &right) {
+            if (left.growth != right.growth) {
+                return left.growth < right.growth;
+            }
+            return left.tie < right.tie;
+        });
+
+        std::size_t elite = std::min<std::size_t>(32, choices.size());
+        uint8_t picked = choices[static_cast<std::size_t>(rng.range(elite))].value;
+        for (uint8_t existing : *labels) {
+            (*group_deltas)[static_cast<std::size_t>(picked ^ existing)] = 1;
+        }
+        labels->push_back(picked);
+    }
+
+    return true;
+}
+
+bool build_difference_pack_labels(const Code &code, Rng &rng,
+                                  std::vector<std::vector<uint8_t>> *group_labels,
+                                  uint64_t *delta_checks)
+{
+    if (group_labels == nullptr || !supports_difference_pack_h2(code)) {
+        return false;
+    }
+    if (delta_checks != nullptr) {
+        *delta_checks = 0;
+    }
+
+    if (build_difference_pack_subspace_labels(code, group_labels, delta_checks)) {
+        return true;
+    }
+    if (build_difference_pack_spread_labels(code, group_labels, delta_checks)) {
+        return true;
+    }
+
+    std::array<uint8_t, 256> used_deltas{};
+    group_labels->clear();
+    group_labels->resize(code.groups.size());
+
+    for (std::size_t group_index = 0; group_index < code.groups.size(); group_index++) {
+        const auto &group = code.groups[group_index];
+        std::array<uint8_t, 256> group_deltas{};
+        if (!build_difference_pack_group(static_cast<int>(group.data.size()), used_deltas, rng,
+                                         &(*group_labels)[group_index], &group_deltas)) {
+            return false;
+        }
+
+        for (int delta = 1; delta < 256; delta++) {
+            if (group_deltas[static_cast<std::size_t>(delta)] != 0) {
+                if (used_deltas[static_cast<std::size_t>(delta)] != 0) {
+                    return false;
+                }
+                used_deltas[static_cast<std::size_t>(delta)] = 1;
+                if (delta_checks != nullptr) {
+                    (*delta_checks)++;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+bool build_difference_pack_h2_candidate(Code *code, Rng &rng, uint64_t *delta_checks)
+{
+    if (code == nullptr || code->construction == 0 || !supports_difference_pack_h2(*code)) {
+        return false;
+    }
+
+    std::vector<std::vector<uint8_t>> group_labels;
+    if (!build_difference_pack_labels(*code, rng, &group_labels, delta_checks)) {
+        return false;
+    }
+
+    reset_identity(code);
+    code->local_mds_guaranteed = true;
+    code->candidate_source = "difference_pack_h2";
+
+    for (std::size_t group_index = 0; group_index < code->groups.size(); group_index++) {
+        const auto &group = code->groups[group_index];
+        for (int data_col : group.data) {
+            code->matrix[idx(group.local_row_start, data_col, code->data)] = 1;
+        }
+    }
+
+    int first_global = code->data + code->local_rows;
+    for (std::size_t group_index = 0; group_index < code->groups.size(); group_index++) {
+        const auto &group = code->groups[group_index];
+        const auto &labels = group_labels[group_index];
+        for (std::size_t local_col = 0; local_col < group.data.size(); local_col++) {
+            uint8_t label = labels[local_col + 1];
+            int data_col = group.data[local_col];
+            code->matrix[idx(first_global, data_col, code->data)] = label;
+            code->matrix[idx(first_global + 1, data_col, code->data)] = gf256_mul(label, label);
+        }
+    }
+
+    return true;
 }
 
 bool use_cauchy_dedup(const Params &params)
@@ -551,6 +890,12 @@ bool erased_pattern_is_recoverable(const Code &code, const std::vector<uint8_t> 
 }
 
 struct RrefResult {
+    int rank = 0;
+    std::vector<int> pivot_columns;
+    std::vector<uint8_t> matrix;
+};
+
+struct RrefScratch {
     int rank = 0;
     std::vector<int> pivot_columns;
     std::vector<uint8_t> matrix;
@@ -615,6 +960,65 @@ int gf256_rank(const std::vector<uint8_t> &matrix, int rows, int cols)
     return gf256_rref(matrix, rows, cols).rank;
 }
 
+int gf256_rank_destructive(std::vector<uint8_t> *matrix, int rows, int cols)
+{
+    if (matrix == nullptr || rows <= 0 || cols <= 0) {
+        return 0;
+    }
+
+    int rank = 0;
+    for (int col = 0; col < cols && rank < rows; col++) {
+        int pivot = -1;
+        for (int row = rank; row < rows; row++) {
+            if ((*matrix)[idx(row, col, cols)] != 0) {
+                pivot = row;
+                break;
+            }
+        }
+        if (pivot < 0) {
+            continue;
+        }
+
+        if (pivot != rank) {
+            for (int c = 0; c < cols; c++) {
+                std::swap((*matrix)[idx(rank, c, cols)], (*matrix)[idx(pivot, c, cols)]);
+            }
+        }
+
+        uint8_t inv_pivot = gf256_inv((*matrix)[idx(rank, col, cols)]);
+        for (int c = 0; c < cols; c++) {
+            (*matrix)[idx(rank, c, cols)] = gf256_mul((*matrix)[idx(rank, c, cols)], inv_pivot);
+        }
+
+        for (int row = 0; row < rows; row++) {
+            if (row == rank) {
+                continue;
+            }
+            uint8_t factor = (*matrix)[idx(row, col, cols)];
+            if (factor == 0) {
+                continue;
+            }
+            for (int c = 0; c < cols; c++) {
+                (*matrix)[idx(row, c, cols)] ^=
+                    gf256_mul(factor, (*matrix)[idx(rank, c, cols)]);
+            }
+        }
+
+        rank++;
+    }
+    return rank;
+}
+
+int gf256_rank_with_scratch(const std::vector<uint8_t> &matrix, int rows, int cols,
+                            std::vector<uint8_t> *scratch)
+{
+    if (scratch == nullptr) {
+        return gf256_rank(matrix, rows, cols);
+    }
+    scratch->assign(matrix.begin(), matrix.end());
+    return gf256_rank_destructive(scratch, rows, cols);
+}
+
 int gf256_rank_small(std::array<uint8_t, 16> matrix, int rows, int cols)
 {
     if (rows <= 0 || cols <= 0) {
@@ -662,32 +1066,100 @@ int gf256_rank_small(std::array<uint8_t, 16> matrix, int rows, int cols)
     return rank;
 }
 
-std::vector<uint8_t> gf256_nullspace_basis(const std::vector<uint8_t> &matrix, int rows, int cols)
+void gf256_rref_with_scratch(const std::vector<uint8_t> &matrix, int rows, int cols,
+                             RrefScratch *result)
 {
-    RrefResult rref = gf256_rref(matrix, rows, cols);
-    std::vector<uint8_t> is_pivot(static_cast<std::size_t>(cols), 0);
-    for (int pivot_col : rref.pivot_columns) {
-        is_pivot[static_cast<std::size_t>(pivot_col)] = 1;
+    if (result == nullptr) {
+        return;
     }
 
-    std::vector<int> free_columns;
+    result->rank = 0;
+    result->pivot_columns.clear();
+    result->matrix.assign(matrix.begin(), matrix.end());
+    if (rows <= 0 || cols <= 0) {
+        return;
+    }
+
+    int rank = 0;
+    for (int col = 0; col < cols && rank < rows; col++) {
+        int pivot = -1;
+        for (int row = rank; row < rows; row++) {
+            if (result->matrix[idx(row, col, cols)] != 0) {
+                pivot = row;
+                break;
+            }
+        }
+        if (pivot < 0) {
+            continue;
+        }
+
+        if (pivot != rank) {
+            for (int c = 0; c < cols; c++) {
+                std::swap(result->matrix[idx(rank, c, cols)],
+                          result->matrix[idx(pivot, c, cols)]);
+            }
+        }
+
+        uint8_t inv_pivot = gf256_inv(result->matrix[idx(rank, col, cols)]);
+        for (int c = 0; c < cols; c++) {
+            result->matrix[idx(rank, c, cols)] =
+                gf256_mul(result->matrix[idx(rank, c, cols)], inv_pivot);
+        }
+
+        for (int row = 0; row < rows; row++) {
+            if (row == rank) {
+                continue;
+            }
+            uint8_t factor = result->matrix[idx(row, col, cols)];
+            if (factor == 0) {
+                continue;
+            }
+            for (int c = 0; c < cols; c++) {
+                result->matrix[idx(row, c, cols)] ^=
+                    gf256_mul(factor, result->matrix[idx(rank, c, cols)]);
+            }
+        }
+
+        result->pivot_columns.push_back(col);
+        rank++;
+    }
+
+    result->rank = rank;
+}
+
+void gf256_nullspace_basis_with_scratch(const std::vector<uint8_t> &matrix, int rows, int cols,
+                                        RrefScratch *rref, std::vector<uint8_t> *is_pivot,
+                                        std::vector<int> *free_columns,
+                                        std::vector<uint8_t> *basis)
+{
+    if (rref == nullptr || is_pivot == nullptr || free_columns == nullptr || basis == nullptr) {
+        return;
+    }
+
+    gf256_rref_with_scratch(matrix, rows, cols, rref);
+    is_pivot->assign(static_cast<std::size_t>(cols), 0);
+    for (int pivot_col : rref->pivot_columns) {
+        (*is_pivot)[static_cast<std::size_t>(pivot_col)] = 1;
+    }
+
+    free_columns->clear();
     for (int col = 0; col < cols; col++) {
-        if (is_pivot[static_cast<std::size_t>(col)] == 0) {
-            free_columns.push_back(col);
+        if ((*is_pivot)[static_cast<std::size_t>(col)] == 0) {
+            free_columns->push_back(col);
         }
     }
 
-    int nullity = static_cast<int>(free_columns.size());
-    std::vector<uint8_t> basis(static_cast<std::size_t>(cols) * static_cast<std::size_t>(nullity), 0);
+    int nullity = static_cast<int>(free_columns->size());
+    basis->assign(static_cast<std::size_t>(cols) * static_cast<std::size_t>(nullity), 0);
     for (int basis_col = 0; basis_col < nullity; basis_col++) {
-        int free_col = free_columns[static_cast<std::size_t>(basis_col)];
-        basis[idx(free_col, basis_col, nullity)] = 1;
-        for (int pivot_row = 0; pivot_row < rref.rank; pivot_row++) {
-            int pivot_col = rref.pivot_columns[static_cast<std::size_t>(pivot_row)];
-            basis[idx(pivot_col, basis_col, nullity)] = rref.matrix[idx(pivot_row, free_col, cols)];
+        int free_col = (*free_columns)[static_cast<std::size_t>(basis_col)];
+        (*basis)[idx(free_col, basis_col, nullity)] = 1;
+        for (int pivot_row = 0; pivot_row < rref->rank; pivot_row++) {
+            int pivot_col = rref->pivot_columns[static_cast<std::size_t>(pivot_row)];
+            (*basis)[idx(pivot_col, basis_col, nullity)] =
+                rref->matrix[idx(pivot_row, free_col, cols)];
         }
     }
-    return basis;
 }
 
 std::vector<uint8_t> transpose_matrix(const std::vector<uint8_t> &matrix, int rows, int cols)
@@ -748,52 +1220,109 @@ bool projective_column_key_packed(const std::array<uint8_t, 16> &matrix, int row
     return true;
 }
 
-std::vector<uint8_t> append_columns(const std::vector<uint8_t> &left, int rows, int left_cols,
-                                    const std::vector<uint8_t> &right, int right_cols)
+bool projective_column_key_packed(const std::vector<uint8_t> &matrix, int rows, int cols,
+                                  int column, uint32_t *key)
 {
-    std::vector<uint8_t> joined(static_cast<std::size_t>(rows) *
-                                    static_cast<std::size_t>(left_cols + right_cols),
-                                0);
+    if (key == nullptr || rows <= 0 || rows > 4) {
+        return false;
+    }
+
+    int pivot = -1;
     for (int row = 0; row < rows; row++) {
-        for (int col = 0; col < left_cols; col++) {
-            joined[idx(row, col, left_cols + right_cols)] = left[idx(row, col, left_cols)];
-        }
-        for (int col = 0; col < right_cols; col++) {
-            joined[idx(row, left_cols + col, left_cols + right_cols)] = right[idx(row, col, right_cols)];
+        if (matrix[static_cast<std::size_t>(idx(row, column, cols))] != 0) {
+            pivot = row;
+            break;
         }
     }
-    return joined;
+    if (pivot < 0) {
+        return false;
+    }
+
+    uint8_t inv_pivot =
+        gf256_inv(matrix[static_cast<std::size_t>(idx(pivot, column, cols))]);
+    uint32_t packed = 0;
+    for (int row = 0; row < rows; row++) {
+        uint8_t value =
+            gf256_mul(matrix[static_cast<std::size_t>(idx(row, column, cols))], inv_pivot);
+        packed |= static_cast<uint32_t>(value) << (8U * static_cast<unsigned int>(row));
+    }
+    *key = packed;
+    return true;
+}
+
+void append_columns_into(const std::vector<uint8_t> &left, int rows, int left_cols,
+                         const std::vector<uint8_t> &right, int right_cols,
+                         std::vector<uint8_t> *joined);
+void project_rows_into(const std::vector<uint8_t> &matrix, int rows, int cols,
+                       const std::vector<int> &kept_rows, std::vector<uint8_t> *projected);
+void build_local_erasure_submatrix_into(const Code &code, int group_index,
+                                        const std::vector<int> &symbols,
+                                        std::vector<uint8_t> *matrix);
+void build_global_erasure_submatrix_into(const Code &code, const std::vector<int> &symbols,
+                                         std::vector<uint8_t> *matrix);
+
+void append_columns_into(const std::vector<uint8_t> &left, int rows, int left_cols,
+                         const std::vector<uint8_t> &right, int right_cols,
+                         std::vector<uint8_t> *joined)
+{
+    if (joined == nullptr) {
+        return;
+    }
+    joined->assign(static_cast<std::size_t>(rows) *
+                       static_cast<std::size_t>(left_cols + right_cols),
+                   0);
+    for (int row = 0; row < rows; row++) {
+        for (int col = 0; col < left_cols; col++) {
+            (*joined)[idx(row, col, left_cols + right_cols)] = left[idx(row, col, left_cols)];
+        }
+        for (int col = 0; col < right_cols; col++) {
+            (*joined)[idx(row, left_cols + col, left_cols + right_cols)] =
+                right[idx(row, col, right_cols)];
+        }
+    }
 }
 
 std::vector<uint8_t> project_rows(const std::vector<uint8_t> &matrix, int rows, int cols,
                                   const std::vector<int> &kept_rows)
 {
-    (void)rows;
-    std::vector<uint8_t> projected(static_cast<std::size_t>(kept_rows.size()) *
-                                       static_cast<std::size_t>(cols),
-                                   0);
-    for (int row = 0; row < static_cast<int>(kept_rows.size()); row++) {
-        int source_row = kept_rows[static_cast<std::size_t>(row)];
-        for (int col = 0; col < cols; col++) {
-            projected[idx(row, col, cols)] = matrix[idx(source_row, col, cols)];
-        }
-    }
+    std::vector<uint8_t> projected;
+    project_rows_into(matrix, rows, cols, kept_rows, &projected);
     return projected;
 }
 
-std::vector<uint8_t> build_local_erasure_submatrix(const Code &code, int group_index,
-                                                   const std::vector<int> &symbols)
+void project_rows_into(const std::vector<uint8_t> &matrix, int rows, int cols,
+                       const std::vector<int> &kept_rows, std::vector<uint8_t> *projected)
 {
+    (void)rows;
+    if (projected == nullptr) {
+        return;
+    }
+    projected->assign(static_cast<std::size_t>(kept_rows.size()) * static_cast<std::size_t>(cols),
+                      0);
+    for (int row = 0; row < static_cast<int>(kept_rows.size()); row++) {
+        int source_row = kept_rows[static_cast<std::size_t>(row)];
+        for (int col = 0; col < cols; col++) {
+            (*projected)[idx(row, col, cols)] = matrix[idx(source_row, col, cols)];
+        }
+    }
+}
+
+void build_local_erasure_submatrix_into(const Code &code, int group_index,
+                                        const std::vector<int> &symbols,
+                                        std::vector<uint8_t> *matrix)
+{
+    if (matrix == nullptr) {
+        return;
+    }
     const auto &group = code.groups[static_cast<std::size_t>(group_index)];
     int local_rows = group.local_parity;
-    std::vector<uint8_t> matrix(static_cast<std::size_t>(local_rows) *
-                                    static_cast<std::size_t>(symbols.size()),
-                                0);
+    matrix->assign(static_cast<std::size_t>(local_rows) * static_cast<std::size_t>(symbols.size()),
+                   0);
     for (int col = 0; col < static_cast<int>(symbols.size()); col++) {
         int symbol = symbols[static_cast<std::size_t>(col)];
         if (symbol < code.data) {
             for (int local = 0; local < local_rows; local++) {
-                matrix[idx(local, col, static_cast<int>(symbols.size()))] =
+                (*matrix)[idx(local, col, static_cast<int>(symbols.size()))] =
                     code.matrix[idx(group.local_row_start + local, symbol, code.data)];
             }
             continue;
@@ -801,18 +1330,21 @@ std::vector<uint8_t> build_local_erasure_submatrix(const Code &code, int group_i
 
         int local_symbol = symbol - group.local_row_start;
         if (local_symbol >= 0 && local_symbol < local_rows) {
-            matrix[idx(local_symbol, col, static_cast<int>(symbols.size()))] = 1;
+            (*matrix)[idx(local_symbol, col, static_cast<int>(symbols.size()))] = 1;
         }
     }
-    return matrix;
 }
 
-std::vector<uint8_t> build_global_erasure_submatrix(const Code &code, const std::vector<int> &symbols)
+void build_global_erasure_submatrix_into(const Code &code, const std::vector<int> &symbols,
+                                         std::vector<uint8_t> *matrix)
 {
+    if (matrix == nullptr) {
+        return;
+    }
     int global_rows = code.global_parity;
-    std::vector<uint8_t> matrix(static_cast<std::size_t>(global_rows) *
-                                    static_cast<std::size_t>(symbols.size()),
-                                0);
+    matrix->assign(static_cast<std::size_t>(global_rows) *
+                       static_cast<std::size_t>(symbols.size()),
+                   0);
     int first_global = code.data + code.local_rows;
     for (int col = 0; col < static_cast<int>(symbols.size()); col++) {
         int symbol = symbols[static_cast<std::size_t>(col)];
@@ -820,11 +1352,10 @@ std::vector<uint8_t> build_global_erasure_submatrix(const Code &code, const std:
             continue;
         }
         for (int global = 0; global < global_rows; global++) {
-            matrix[idx(global, col, static_cast<int>(symbols.size()))] =
+            (*matrix)[idx(global, col, static_cast<int>(symbols.size()))] =
                 code.matrix[idx(first_global + global, symbol, code.data)];
         }
     }
-    return matrix;
 }
 
 uint8_t local_erasure_coefficient(const Code &code, int group_index, int symbol)
@@ -848,27 +1379,86 @@ uint8_t global_erasure_coefficient(const Code &code, int global_row, int symbol)
     return code.matrix[idx(first_global + global_row, symbol, code.data)];
 }
 
-std::vector<uint8_t> build_residual_erasure_block_a1(const Code &code, int group_index,
-                                                     const std::vector<int> &erased_symbols,
-                                                     int extra)
-{
-    int global_rows = code.global_parity;
-    std::vector<uint8_t> residual(static_cast<std::size_t>(global_rows) *
-                                      static_cast<std::size_t>(extra),
-                                  0);
+struct ResidualBuildScratch {
+    std::vector<uint8_t> local;
+    std::vector<uint8_t> nullspace;
+    std::vector<uint8_t> global;
+    RrefScratch rref;
+    std::vector<uint8_t> is_pivot;
+    std::vector<int> free_columns;
+};
 
+struct ScratchCapacityHint {
+    std::size_t max_group_symbols = 0;
+    std::size_t max_local_entries = 0;
+    std::size_t max_global_entries = 0;
+    std::size_t max_nullspace_entries = 0;
+    std::size_t max_residual_entries = 0;
+    std::size_t max_square_entries = 0;
+};
+
+ScratchCapacityHint scratch_capacity_hint(const Code &code)
+{
+    ScratchCapacityHint hint;
+    hint.max_square_entries =
+        static_cast<std::size_t>(code.global_parity) * static_cast<std::size_t>(code.global_parity);
+    hint.max_residual_entries = hint.max_square_entries;
+
+    for (const auto &group : code.groups) {
+        std::size_t symbols = group.data.size() + static_cast<std::size_t>(group.local_parity);
+        hint.max_group_symbols = std::max(hint.max_group_symbols, symbols);
+        hint.max_local_entries =
+            std::max(hint.max_local_entries, static_cast<std::size_t>(group.local_parity) * symbols);
+        hint.max_global_entries =
+            std::max(hint.max_global_entries, static_cast<std::size_t>(code.global_parity) * symbols);
+        hint.max_nullspace_entries =
+            std::max(hint.max_nullspace_entries, symbols * static_cast<std::size_t>(code.global_parity));
+    }
+    return hint;
+}
+
+void reserve_residual_build_scratch(ResidualBuildScratch *scratch, const ScratchCapacityHint &hint)
+{
+    if (scratch == nullptr) {
+        return;
+    }
+    scratch->local.reserve(hint.max_local_entries);
+    scratch->nullspace.reserve(hint.max_nullspace_entries);
+    scratch->global.reserve(hint.max_global_entries);
+    scratch->rref.matrix.reserve(hint.max_local_entries);
+    scratch->rref.pivot_columns.reserve(hint.max_group_symbols);
+    scratch->is_pivot.reserve(hint.max_group_symbols);
+    scratch->free_columns.reserve(hint.max_group_symbols);
+}
+
+void build_residual_erasure_block_a1_into(const Code &code, int group_index,
+                                          const std::vector<int> &erased_symbols, int extra,
+                                          std::vector<uint8_t> *residual);
+void build_residual_erasure_block_into(const Code &code, int group_index,
+                                       const std::vector<int> &erased_symbols, int extra,
+                                       std::vector<uint8_t> *residual,
+                                       ResidualBuildScratch *scratch);
+
+void build_residual_erasure_block_a1_into(const Code &code, int group_index,
+                                          const std::vector<int> &erased_symbols, int extra,
+                                          std::vector<uint8_t> *residual)
+{
+    if (residual == nullptr) {
+        return;
+    }
+    int global_rows = code.global_parity;
+    residual->assign(static_cast<std::size_t>(global_rows) * static_cast<std::size_t>(extra), 0);
     int pivot = erased_symbols.front();
     uint8_t inv_pivot = gf256_inv(local_erasure_coefficient(code, group_index, pivot));
     for (int col = 0; col < extra; col++) {
         int symbol = erased_symbols[static_cast<std::size_t>(col + 1)];
         uint8_t scale = gf256_mul(local_erasure_coefficient(code, group_index, symbol), inv_pivot);
         for (int row = 0; row < global_rows; row++) {
-            residual[idx(row, col, extra)] =
+            (*residual)[idx(row, col, extra)] =
                 global_erasure_coefficient(code, row, symbol) ^
                 gf256_mul(scale, global_erasure_coefficient(code, row, pivot));
         }
     }
-    return residual;
 }
 
 void build_residual_erasure_block_a1_small(const Code &code, int group_index,
@@ -889,34 +1479,41 @@ void build_residual_erasure_block_a1_small(const Code &code, int group_index,
     }
 }
 
-std::vector<uint8_t> build_residual_erasure_block(const Code &code, int group_index,
-                                                  const std::vector<int> &erased_symbols,
-                                                  int extra)
+void build_residual_erasure_block_into(const Code &code, int group_index,
+                                       const std::vector<int> &erased_symbols, int extra,
+                                       std::vector<uint8_t> *residual,
+                                       ResidualBuildScratch *scratch)
 {
+    if (residual == nullptr) {
+        return;
+    }
     const auto &group = code.groups[static_cast<std::size_t>(group_index)];
     if (group.local_parity == 1) {
-        return build_residual_erasure_block_a1(code, group_index, erased_symbols, extra);
+        build_residual_erasure_block_a1_into(code, group_index, erased_symbols, extra, residual);
+        return;
     }
 
-    std::vector<uint8_t> local = build_local_erasure_submatrix(code, group_index, erased_symbols);
-    std::vector<uint8_t> nullspace =
-        gf256_nullspace_basis(local, group.local_parity, static_cast<int>(erased_symbols.size()));
-    std::vector<uint8_t> global = build_global_erasure_submatrix(code, erased_symbols);
-    std::vector<uint8_t> residual(static_cast<std::size_t>(code.global_parity) *
-                                      static_cast<std::size_t>(extra),
-                                  0);
+    ResidualBuildScratch local_scratch;
+    ResidualBuildScratch *work = scratch == nullptr ? &local_scratch : scratch;
+    build_local_erasure_submatrix_into(code, group_index, erased_symbols, &work->local);
+    gf256_nullspace_basis_with_scratch(work->local, group.local_parity,
+                                       static_cast<int>(erased_symbols.size()), &work->rref,
+                                       &work->is_pivot, &work->free_columns, &work->nullspace);
+    build_global_erasure_submatrix_into(code, erased_symbols, &work->global);
+    residual->assign(static_cast<std::size_t>(code.global_parity) * static_cast<std::size_t>(extra),
+                     0);
 
     for (int row = 0; row < code.global_parity; row++) {
         for (int col = 0; col < extra; col++) {
             uint8_t value = 0;
             for (int inner = 0; inner < static_cast<int>(erased_symbols.size()); inner++) {
-                value ^= gf256_mul(global[idx(row, inner, static_cast<int>(erased_symbols.size()))],
-                                   nullspace[idx(inner, col, extra)]);
+                value ^= gf256_mul(
+                    work->global[idx(row, inner, static_cast<int>(erased_symbols.size()))],
+                    work->nullspace[idx(inner, col, extra)]);
             }
-            residual[idx(row, col, extra)] = value;
+            (*residual)[idx(row, col, extra)] = value;
         }
     }
-    return residual;
 }
 
 template <typename Fn>
@@ -937,6 +1534,24 @@ bool enumerate_combinations(const std::vector<int> &items, int need, int start, 
         chosen->pop_back();
     }
     return true;
+}
+
+std::size_t combination_count(int n, int k)
+{
+    if (k < 0 || n < 0 || k > n) {
+        return 0;
+    }
+    k = std::min(k, n - k);
+    std::size_t result = 1;
+    for (int i = 1; i <= k; i++) {
+        std::size_t numerator = static_cast<std::size_t>(n - k + i);
+        if (result > std::numeric_limits<std::size_t>::max() / numerator) {
+            return std::numeric_limits<std::size_t>::max();
+        }
+        result *= numerator;
+        result /= static_cast<std::size_t>(i);
+    }
+    return result;
 }
 
 struct ResidualBlock {
@@ -961,18 +1576,77 @@ struct DualParent {
 };
 
 struct DualGroupOptions {
-    std::vector<const ResidualBlock *> by_extra;
+    std::array<const ResidualBlock *, 5> by_extra{};
 };
 
 class ResidualVerifier {
 public:
-    explicit ResidualVerifier(const Code &code, CheckResult *result)
-        : code_(code), result_(result), group_erased_(code.groups.size()), h_(code.global_parity)
+    explicit ResidualVerifier(const Code &code)
+        : code_(code), group_erased_(code.groups.size()), h_(code.global_parity)
     {
+        const auto group_count = code_.groups.size();
+        const auto h_slots = static_cast<std::size_t>(h_ + 1);
+        const ScratchCapacityHint scratch_hint = scratch_capacity_hint(code_);
+
+        residual_blocks_.resize(group_count);
+        residual_block_counts_.assign(group_count, std::vector<std::size_t>(h_slots, 0));
+        for (std::size_t group_index = 0; group_index < group_count; group_index++) {
+            const auto &group = code_.groups[group_index];
+            group_symbols_.push_back(group_symbol_ids(code_, static_cast<int>(group_index)));
+            group_erased_[group_index].reserve(group.data.size() +
+                                               static_cast<std::size_t>(group.local_parity));
+            residual_blocks_[group_index].by_extra.resize(h_slots);
+            int max_extra = std::min(h_, static_cast<int>(group_symbols_.back().size()) -
+                                             group.local_parity);
+            for (int extra = 1; extra <= max_extra; extra++) {
+                std::size_t block_count =
+                    combination_count(static_cast<int>(group_symbols_.back().size()),
+                                      group.local_parity + extra);
+                auto &blocks = residual_blocks_[group_index].by_extra[static_cast<std::size_t>(extra)];
+                blocks.resize(block_count);
+                std::size_t erased_capacity =
+                    static_cast<std::size_t>(group.local_parity + extra);
+                std::size_t matrix_capacity =
+                    static_cast<std::size_t>(h_) * static_cast<std::size_t>(extra);
+                for (auto &block : blocks) {
+                    block.erased_symbols.reserve(erased_capacity);
+                    block.matrix.reserve(matrix_capacity);
+                }
+            }
+        }
+        combination_scratch_.reserve(scratch_hint.max_group_symbols);
+        local_scratch_.reserve(scratch_hint.max_local_entries);
+        projected_scratch_.reserve(scratch_hint.max_square_entries);
+        joined_scratch_.reserve(scratch_hint.max_square_entries);
+        rank_scratch_.reserve(std::max(scratch_hint.max_square_entries,
+                                       scratch_hint.max_local_entries));
+        reserve_residual_build_scratch(&residual_build_scratch_, scratch_hint);
+        dual_reachable_.resize(h_slots);
+        dual_next_.resize(h_slots);
+        dual_parents_.resize(group_count + 1);
+        for (auto &row : dual_parents_) {
+            row.resize(h_slots);
+        }
+
+        dual_options_scratch_.resize(group_count);
+        dual_y_scratch_.resize(static_cast<std::size_t>(h_));
+        dual_basis_scratch_.reserve(static_cast<std::size_t>(h_) * static_cast<std::size_t>(h_));
+        dual_transposed_scratch_.reserve(static_cast<std::size_t>(h_) * static_cast<std::size_t>(h_));
+        dual_coefficients_scratch_.reserve(static_cast<std::size_t>(h_));
+        dual_is_pivot_scratch_.reserve(static_cast<std::size_t>(h_));
+        dual_free_columns_scratch_.reserve(static_cast<std::size_t>(h_));
+        dual_rref_scratch_.matrix.reserve(static_cast<std::size_t>(h_) * static_cast<std::size_t>(h_));
+        dual_rref_scratch_.pivot_columns.reserve(static_cast<std::size_t>(h_));
+        generic_matrix_scratch_.resize(group_count + 1);
+        for (auto &matrix : generic_matrix_scratch_) {
+            matrix.reserve(scratch_hint.max_square_entries);
+        }
+        global_completion_rows_scratch_.reserve(static_cast<std::size_t>(h_));
     }
 
-    void run()
+    void run(CheckResult *result)
     {
+        reset(result);
         precompute_residual_blocks();
         if (!should_stop()) {
             if (h_ == 2) {
@@ -984,8 +1658,8 @@ public:
             } else if (h_ == 4 && !verify_by_streaming_dual(kH4StreamingDualLimit)) {
                 verify_by_dual_index();
             } else {
-                std::vector<uint8_t> empty;
-                verify_from_group(0, 0, empty);
+                generic_empty_matrix_.clear();
+                verify_from_group(0, 0, generic_empty_matrix_);
             }
         }
         result_->is_mr = result_->failures == 0;
@@ -996,20 +1670,27 @@ public:
     }
 
 private:
+    void reset(CheckResult *result)
+    {
+        result_ = result;
+        for (auto &erased : group_erased_) {
+            erased.clear();
+        }
+        for (auto &by_extra : residual_block_counts_) {
+            std::fill(by_extra.begin(), by_extra.end(), 0);
+        }
+        verified_states_.clear();
+        h2_seen_lines_.clear();
+        dual_index_.clear();
+        dual_index_options_.clear();
+        checked_streaming_dual_keys_.clear();
+        streaming_dual_limit_ = 0;
+        streaming_dual_limit_hit_ = false;
+    }
+
     bool should_stop() const
     {
         return result_->failures > 0;
-    }
-
-    std::vector<uint8_t> build_local_submatrix(int group_index, const std::vector<int> &symbols) const
-    {
-        return build_local_erasure_submatrix(code_, group_index, symbols);
-    }
-
-    std::vector<uint8_t> build_residual_block(int group_index, const std::vector<int> &erased_symbols,
-                                              int extra) const
-    {
-        return build_residual_erasure_block(code_, group_index, erased_symbols, extra);
     }
 
     void mark_failure_with_erased(const std::vector<std::vector<int>> &group_erased,
@@ -1063,45 +1744,106 @@ private:
         mark_failure_with_erased(group_erased, first_kept_global_rows(extra));
     }
 
+    struct ResidualBlockRange {
+        const ResidualBlock *data = nullptr;
+        std::size_t count = 0;
+
+        const ResidualBlock *begin() const { return data; }
+        const ResidualBlock *end() const { return count == 0 ? data : data + count; }
+        std::size_t size() const { return count; }
+        bool empty() const { return count == 0; }
+    };
+
+    ResidualBlock &next_residual_block(int group_index, int extra)
+    {
+        auto &blocks = residual_blocks_[static_cast<std::size_t>(group_index)]
+                           .by_extra[static_cast<std::size_t>(extra)];
+        auto &count = residual_block_counts_[static_cast<std::size_t>(group_index)]
+                                            [static_cast<std::size_t>(extra)];
+        if (count >= blocks.size()) {
+            blocks.emplace_back();
+        }
+
+        ResidualBlock &block = blocks[count++];
+        block.extra = extra;
+        block.erased_symbols.clear();
+        block.matrix.clear();
+        block.small_matrix.fill(0);
+        block.small_rows = 0;
+        block.small_cols = 0;
+        block.has_small_matrix = false;
+        return block;
+    }
+
+    ResidualBlockRange residual_blocks_for_extra(int group_index, int extra) const
+    {
+        if (group_index < 0 || group_index >= static_cast<int>(residual_blocks_.size())) {
+            return {};
+        }
+        const auto &group_blocks = residual_blocks_[static_cast<std::size_t>(group_index)];
+        if (extra < 0 || extra >= static_cast<int>(group_blocks.by_extra.size())) {
+            return {};
+        }
+        const auto &blocks = group_blocks.by_extra[static_cast<std::size_t>(extra)];
+        std::size_t count =
+            residual_block_counts_[static_cast<std::size_t>(group_index)]
+                                  [static_cast<std::size_t>(extra)];
+        return {blocks.empty() ? nullptr : blocks.data(), std::min(count, blocks.size())};
+    }
+
     void precompute_group(int group_index)
     {
         const auto &group = code_.groups[static_cast<std::size_t>(group_index)];
-        std::vector<int> symbols = group_symbol_ids(code_, group_index);
+        const std::vector<int> &symbols = group_symbols_[static_cast<std::size_t>(group_index)];
         int max_extra = std::min(h_, static_cast<int>(symbols.size()) - group.local_parity);
-        GroupResidualBlocks group_blocks;
-        group_blocks.by_extra.resize(static_cast<std::size_t>(h_ + 1));
+        GroupResidualBlocks &group_blocks = residual_blocks_[static_cast<std::size_t>(group_index)];
+        if (group_blocks.by_extra.size() != static_cast<std::size_t>(h_ + 1)) {
+            group_blocks.by_extra.resize(static_cast<std::size_t>(h_ + 1));
+        }
 
         for (int extra = 0; extra <= max_extra; extra++) {
             int need = group.local_parity + extra;
-            std::vector<int> chosen;
-            enumerate_combinations(symbols, need, 0, &chosen, [&](const std::vector<int> &erased_symbols) {
-                if (should_stop()) {
-                    return false;
-                }
+            combination_scratch_.clear();
+            enumerate_combinations(symbols, need, 0, &combination_scratch_,
+                                   [&](const std::vector<int> &erased_symbols) {
+                                       if (should_stop()) {
+                                           return false;
+                                       }
 
-                std::vector<uint8_t> local = build_local_submatrix(group_index, erased_symbols);
-                result_->patterns_checked++;
-                if (gf256_rank(local, group.local_parity, need) < group.local_parity) {
-                    mark_precompute_failure(group_index, erased_symbols, extra);
-                    return false;
-                }
+                                       if (!code_.local_mds_guaranteed) {
+                                           build_local_erasure_submatrix_into(
+                                               code_, group_index, erased_symbols, &local_scratch_);
+                                           result_->patterns_checked++;
+                                           if (gf256_rank_destructive(&local_scratch_,
+                                                                      group.local_parity, need) <
+                                               group.local_parity) {
+                                               mark_precompute_failure(group_index, erased_symbols,
+                                                                       extra);
+                                               return false;
+                                           }
+                                       }
 
-                if (extra == 0) {
-                    return true;
-                }
+                                       if (extra == 0) {
+                                           return true;
+                                       }
 
-                ResidualBlock block;
-                block.extra = extra;
-                block.erased_symbols = erased_symbols;
-                block.matrix = build_residual_block(group_index, erased_symbols, extra);
-                result_->patterns_checked++;
-                if (gf256_rank(block.matrix, h_, extra) < extra) {
-                    mark_precompute_failure(group_index, erased_symbols, extra);
-                    return false;
-                }
-                group_blocks.by_extra[static_cast<std::size_t>(extra)].push_back(std::move(block));
-                return true;
-            });
+                                       ResidualBlock &block =
+                                           next_residual_block(group_index, extra);
+                                       block.extra = extra;
+                                       block.erased_symbols.assign(erased_symbols.begin(),
+                                                                   erased_symbols.end());
+                                       build_residual_erasure_block_into(
+                                           code_, group_index, erased_symbols, extra, &block.matrix,
+                                           &residual_build_scratch_);
+                                       result_->patterns_checked++;
+                                       if (gf256_rank_with_scratch(block.matrix, h_, extra,
+                                                                   &rank_scratch_) < extra) {
+                                           mark_precompute_failure(group_index, erased_symbols,
+                                                                   extra);
+                                           return false;
+                                       }
+                                       return true;
+                                   });
             if (should_stop()) {
                 return;
             }
@@ -1109,25 +1851,27 @@ private:
 
         for (int extra = 1; extra <= max_extra; extra++) {
             auto &blocks = group_blocks.by_extra[static_cast<std::size_t>(extra)];
+            auto &active_count =
+                residual_block_counts_[static_cast<std::size_t>(group_index)]
+                                      [static_cast<std::size_t>(extra)];
             std::set<std::vector<uint8_t>> seen_spaces;
-            std::vector<ResidualBlock> unique_blocks;
-            unique_blocks.reserve(blocks.size());
-            for (auto &block : blocks) {
+            std::size_t write = 0;
+            for (std::size_t read = 0; read < active_count; read++) {
+                auto &block = blocks[read];
                 std::vector<uint8_t> key = column_space_key(block.matrix, h_, extra);
                 if (seen_spaces.insert(std::move(key)).second) {
-                    unique_blocks.push_back(std::move(block));
+                    if (write != read) {
+                        std::swap(blocks[write], blocks[read]);
+                    }
+                    write++;
                 }
             }
-            blocks = std::move(unique_blocks);
+            active_count = write;
         }
-
-        residual_blocks_.push_back(std::move(group_blocks));
     }
 
     void precompute_residual_blocks()
     {
-        residual_blocks_.clear();
-        residual_blocks_.reserve(code_.groups.size());
         for (int group_index = 0; group_index < static_cast<int>(code_.groups.size()); group_index++) {
             precompute_group(group_index);
             if (should_stop()) {
@@ -1158,8 +1902,8 @@ private:
                 return;
             }
 
-            std::vector<uint8_t> projected = project_rows(current, h_, used, *kept_rows);
-            if (gf256_rank(projected, used, used) < used) {
+            project_rows_into(current, h_, used, *kept_rows, &projected_scratch_);
+            if (gf256_rank_destructive(&projected_scratch_, used, used) < used) {
                 mark_failure_with_erased(group_erased_, *kept_rows);
             }
             return;
@@ -1178,8 +1922,8 @@ private:
 
     bool verify_global_completions(const std::vector<uint8_t> &current, int used)
     {
-        std::vector<int> kept_rows;
-        check_global_completions(current, used, 0, &kept_rows);
+        global_completion_rows_scratch_.clear();
+        check_global_completions(current, used, 0, &global_completion_rows_scratch_);
         return !should_stop();
     }
 
@@ -1197,17 +1941,13 @@ private:
             return true;
         }
 
-        const auto &group_blocks = residual_blocks_[static_cast<std::size_t>(group_index)];
-        if (extra >= static_cast<int>(group_blocks.by_extra.size())) {
-            return true;
-        }
-
         int rows = static_cast<int>(kept_rows.size());
-        projected->reserve(group_blocks.by_extra[static_cast<std::size_t>(extra)].size());
-        for (const auto &block : group_blocks.by_extra[static_cast<std::size_t>(extra)]) {
+        ResidualBlockRange blocks = residual_blocks_for_extra(group_index, extra);
+        projected->reserve(blocks.size());
+        for (const auto &block : blocks) {
             std::vector<uint8_t> matrix = project_rows(block.matrix, h_, extra, kept_rows);
             result_->patterns_checked++;
-            if (gf256_rank(matrix, rows, extra) < extra) {
+            if (gf256_rank_with_scratch(matrix, rows, extra, &rank_scratch_) < extra) {
                 std::vector<std::vector<int>> group_erased(code_.groups.size());
                 group_erased[static_cast<std::size_t>(group_index)] = block.erased_symbols;
                 mark_failure_with_erased(group_erased, kept_rows);
@@ -1234,10 +1974,10 @@ private:
                     continue;
                 }
 
-                std::vector<uint8_t> joined =
-                    append_columns(left.matrix, rows, extra0, right.matrix, extra1);
+                append_columns_into(left.matrix, rows, extra0, right.matrix, extra1,
+                                    &joined_scratch_);
                 result_->patterns_checked++;
-                if (gf256_rank(joined, rows, rows) < rows) {
+                if (gf256_rank_destructive(&joined_scratch_, rows, rows) < rows) {
                     std::vector<std::vector<int>> group_erased(code_.groups.size());
                     group_erased[0] = left.source->erased_symbols;
                     group_erased[1] = right.source->erased_symbols;
@@ -1284,29 +2024,90 @@ private:
         return true;
     }
 
-    std::vector<uint8_t> block_vector(const ResidualBlock &block) const
+    std::size_t residual_block_count_for_extra(int extra) const
     {
-        std::vector<uint8_t> vector(static_cast<std::size_t>(h_), 0);
-        for (int row = 0; row < h_; row++) {
-            vector[static_cast<std::size_t>(row)] = block.matrix[idx(row, 0, block.extra)];
+        std::size_t total = 0;
+        for (int group_index = 0; group_index < static_cast<int>(residual_blocks_.size());
+             group_index++) {
+            total += residual_blocks_for_extra(group_index, extra).size();
         }
-        return vector;
+        return total;
+    }
+
+    std::size_t h2_line_capacity_hint() const
+    {
+        return residual_block_count_for_extra(1);
+    }
+
+    std::size_t projective_vector_count_for_dim(int dim) const
+    {
+        switch (dim) {
+        case 1:
+            return 1;
+        case 2:
+            return 257;
+        case 3:
+            return 65793;
+        case 4:
+            return 16843009;
+        default:
+            return dim <= 0 ? 0 : std::numeric_limits<std::size_t>::max();
+        }
+    }
+
+    std::size_t dual_key_capacity_hint(std::size_t cap) const
+    {
+        std::size_t total = 0;
+        for (int group_index = 0; group_index < static_cast<int>(residual_blocks_.size());
+             group_index++) {
+            const auto &group_blocks = residual_blocks_[static_cast<std::size_t>(group_index)];
+            for (int extra = 1; extra < static_cast<int>(group_blocks.by_extra.size()) && extra <= h_;
+                 extra++) {
+                std::size_t per_block = projective_vector_count_for_dim(h_ - extra);
+                std::size_t block_count = residual_blocks_for_extra(group_index, extra).size();
+                if (per_block == 0 || block_count == 0) {
+                    continue;
+                }
+                if (per_block >= cap || block_count >= cap / per_block ||
+                    total >= cap - per_block * block_count) {
+                    return cap;
+                }
+                total += per_block * block_count;
+            }
+        }
+        return total;
+    }
+
+    std::size_t streaming_dual_key_capacity_hint(uint64_t limit) const
+    {
+        std::size_t cap = projective_vector_count_for_dim(h_);
+        if (limit != 0 && limit < cap) {
+            cap = static_cast<std::size_t>(limit);
+        }
+        return dual_key_capacity_hint(cap);
+    }
+
+    std::size_t dual_index_capacity_hint() const
+    {
+        constexpr std::size_t kDualIndexReserveCap = 1U << 20U;
+        return dual_key_capacity_hint(std::min(projective_vector_count_for_dim(h_),
+                                               kDualIndexReserveCap));
     }
 
     bool verify_h2_fast_path()
     {
-        std::unordered_map<std::string, std::pair<int, const ResidualBlock *>> seen_lines;
+        h2_seen_lines_.clear();
+        h2_seen_lines_.reserve(h2_line_capacity_hint());
         for (int group_index = 0; group_index < static_cast<int>(residual_blocks_.size()); group_index++) {
-            const auto &group_blocks = residual_blocks_[static_cast<std::size_t>(group_index)];
-            if (group_blocks.by_extra.size() <= 1) {
+            ResidualBlockRange blocks = residual_blocks_for_extra(group_index, 1);
+            if (blocks.empty()) {
                 continue;
             }
 
-            for (const auto &block : group_blocks.by_extra[1]) {
+            for (const auto &block : blocks) {
                 result_->patterns_checked++;
-                std::vector<uint8_t> vector = block_vector(block);
                 for (int row = 0; row < h_; row++) {
-                    if (vector[static_cast<std::size_t>(row)] == 0) {
+                    if (block.matrix[idx(row, 0, block.extra)] == 0) {
                         std::vector<std::vector<int>> group_erased(code_.groups.size());
                         group_erased[static_cast<std::size_t>(group_index)] = block.erased_symbols;
                         mark_failure_with_erased(group_erased, std::vector<int>{row});
@@ -1314,9 +2115,12 @@ private:
                     }
                 }
 
-                std::string line = canonical_dual_key(vector);
-                auto found = seen_lines.find(line);
-                if (found != seen_lines.end()) {
+                uint32_t line = 0;
+                if (!projective_column_key_packed(block.matrix, h_, block.extra, 0, &line)) {
+                    continue;
+                }
+                auto found = h2_seen_lines_.find(line);
+                if (found != h2_seen_lines_.end()) {
                     int previous_group = found->second.first;
                     if (previous_group != group_index) {
                         std::vector<std::vector<int>> group_erased(code_.groups.size());
@@ -1327,7 +2131,7 @@ private:
                         return false;
                     }
                 } else {
-                    seen_lines.emplace(std::move(line), std::make_pair(group_index, &block));
+                    h2_seen_lines_.emplace(line, std::make_pair(group_index, &block));
                 }
             }
         }
@@ -1396,31 +2200,33 @@ private:
         mark_failure_with_erased(group_erased, kept_rows_for_dual_failure(y, used));
     }
 
-    bool check_dual_options(const std::vector<uint8_t> &y, const std::vector<DualGroupOptions> &options)
+    bool check_dual_options(const std::vector<uint8_t> &y, const DualGroupOptions *options)
     {
         result_->patterns_checked++;
+        if (options == nullptr) {
+            return true;
+        }
         int min_used = support_size(y);
-        std::vector<uint8_t> reachable(static_cast<std::size_t>(h_ + 1), 0);
-        reachable[0] = 1;
-
-        std::vector<std::vector<DualParent>> parents(
-            code_.groups.size() + 1,
-            std::vector<DualParent>(static_cast<std::size_t>(h_ + 1)));
-        parents[0][0].reachable = true;
+        std::fill(dual_reachable_.begin(), dual_reachable_.end(), 0);
+        for (auto &row : dual_parents_) {
+            std::fill(row.begin(), row.end(), DualParent{});
+        }
+        dual_reachable_[0] = 1;
+        dual_parents_[0][0].reachable = true;
 
         for (int group_index = 0; group_index < static_cast<int>(code_.groups.size()); group_index++) {
             const auto &option = options[static_cast<std::size_t>(group_index)].by_extra;
 
-            std::vector<uint8_t> next(static_cast<std::size_t>(h_ + 1), 0);
+            std::fill(dual_next_.begin(), dual_next_.end(), 0);
             for (int sum = 0; sum <= h_; sum++) {
-                if (reachable[static_cast<std::size_t>(sum)] == 0) {
+                if (dual_reachable_[static_cast<std::size_t>(sum)] == 0) {
                     continue;
                 }
 
-                if (next[static_cast<std::size_t>(sum)] == 0) {
-                    next[static_cast<std::size_t>(sum)] = 1;
-                    DualParent &parent = parents[static_cast<std::size_t>(group_index + 1)]
-                                                [static_cast<std::size_t>(sum)];
+                if (dual_next_[static_cast<std::size_t>(sum)] == 0) {
+                    dual_next_[static_cast<std::size_t>(sum)] = 1;
+                    DualParent &parent = dual_parents_[static_cast<std::size_t>(group_index + 1)]
+                                                      [static_cast<std::size_t>(sum)];
                     parent.reachable = true;
                     parent.previous_sum = sum;
                     parent.extra = 0;
@@ -1433,12 +2239,12 @@ private:
                         continue;
                     }
                     int next_sum = sum + extra;
-                    if (next[static_cast<std::size_t>(next_sum)] != 0) {
+                    if (dual_next_[static_cast<std::size_t>(next_sum)] != 0) {
                         continue;
                     }
-                    next[static_cast<std::size_t>(next_sum)] = 1;
-                    DualParent &parent = parents[static_cast<std::size_t>(group_index + 1)]
-                                                [static_cast<std::size_t>(next_sum)];
+                    dual_next_[static_cast<std::size_t>(next_sum)] = 1;
+                    DualParent &parent = dual_parents_[static_cast<std::size_t>(group_index + 1)]
+                                                      [static_cast<std::size_t>(next_sum)];
                     parent.reachable = true;
                     parent.previous_sum = sum;
                     parent.extra = extra;
@@ -1447,22 +2253,23 @@ private:
             }
 
             for (int used = min_used; used <= h_; used++) {
-                if (next[static_cast<std::size_t>(used)] != 0) {
-                    mark_dual_failure(parents, group_index + 1, used, y);
+                if (dual_next_[static_cast<std::size_t>(used)] != 0) {
+                    mark_dual_failure(dual_parents_, group_index + 1, used, y);
                     return false;
                 }
             }
 
-            reachable = std::move(next);
+            std::swap(dual_reachable_, dual_next_);
         }
 
         return true;
     }
 
-    std::string canonical_dual_key(const std::vector<uint8_t> &y) const
+    bool canonical_dual_key_packed(const std::vector<uint8_t> &y, uint32_t *key) const
     {
-        std::string key;
-        key.resize(static_cast<std::size_t>(h_));
+        if (key == nullptr || h_ <= 0 || h_ > 4) {
+            return false;
+        }
         int pivot = -1;
         for (int row = 0; row < h_; row++) {
             if (y[static_cast<std::size_t>(row)] != 0) {
@@ -1471,71 +2278,85 @@ private:
             }
         }
         if (pivot < 0) {
-            return {};
+            return false;
         }
 
         uint8_t inv_pivot = gf256_inv(y[static_cast<std::size_t>(pivot)]);
+        uint32_t packed = 0;
         for (int row = 0; row < h_; row++) {
-            key[static_cast<std::size_t>(row)] =
-                static_cast<char>(gf256_mul(y[static_cast<std::size_t>(row)], inv_pivot));
+            uint8_t value = gf256_mul(y[static_cast<std::size_t>(row)], inv_pivot);
+            packed |= static_cast<uint32_t>(value) << (8U * static_cast<unsigned int>(row));
         }
-        return key;
+        *key = packed;
+        return true;
     }
 
-    std::vector<uint8_t> left_nullspace_basis(const ResidualBlock &block) const
+    void left_nullspace_basis_into(const ResidualBlock &block, std::vector<uint8_t> *basis)
     {
-        std::vector<uint8_t> transposed(static_cast<std::size_t>(block.extra) *
+        if (basis == nullptr) {
+            return;
+        }
+
+        dual_transposed_scratch_.assign(static_cast<std::size_t>(block.extra) *
                                             static_cast<std::size_t>(h_),
                                         0);
         for (int row = 0; row < h_; row++) {
             for (int col = 0; col < block.extra; col++) {
-                transposed[idx(col, row, h_)] = block.matrix[idx(row, col, block.extra)];
+                dual_transposed_scratch_[idx(col, row, h_)] =
+                    block.matrix[idx(row, col, block.extra)];
             }
         }
-        return gf256_nullspace_basis(transposed, block.extra, h_);
+        gf256_nullspace_basis_with_scratch(dual_transposed_scratch_, block.extra, h_,
+                                           &dual_rref_scratch_, &dual_is_pivot_scratch_,
+                                           &dual_free_columns_scratch_, basis);
     }
 
-    std::vector<uint8_t> dual_from_coefficients(const std::vector<uint8_t> &basis, int dim,
-                                                const std::vector<uint8_t> &coefficients) const
+    void dual_from_coefficients_into(const std::vector<uint8_t> &basis, int dim,
+                                     const std::vector<uint8_t> &coefficients,
+                                     std::vector<uint8_t> *y) const
     {
-        std::vector<uint8_t> y(static_cast<std::size_t>(h_), 0);
+        if (y == nullptr) {
+            return;
+        }
+        y->assign(static_cast<std::size_t>(h_), 0);
         for (int row = 0; row < h_; row++) {
             uint8_t value = 0;
             for (int col = 0; col < dim; col++) {
                 value ^= gf256_mul(basis[idx(row, col, dim)],
                                    coefficients[static_cast<std::size_t>(col)]);
             }
-            y[static_cast<std::size_t>(row)] = value;
+            (*y)[static_cast<std::size_t>(row)] = value;
         }
-        return y;
     }
 
-    std::vector<uint8_t> dual_vector_from_key(const std::string &key) const
+    void dual_vector_from_key_into(uint32_t key, std::vector<uint8_t> *y) const
     {
-        std::vector<uint8_t> y(static_cast<std::size_t>(h_), 0);
+        if (y == nullptr) {
+            return;
+        }
+        y->assign(static_cast<std::size_t>(h_), 0);
         for (int row = 0; row < h_; row++) {
-            y[static_cast<std::size_t>(row)] = static_cast<uint8_t>(key[static_cast<std::size_t>(row)]);
+            (*y)[static_cast<std::size_t>(row)] =
+                static_cast<uint8_t>((key >> (8U * static_cast<unsigned int>(row))) & 0xffU);
         }
-        return y;
     }
 
-    std::vector<DualGroupOptions> dual_options_for_vector(const std::vector<uint8_t> &y) const
+    const DualGroupOptions *dual_options_for_vector(const std::vector<uint8_t> &y)
     {
-        std::vector<DualGroupOptions> options(code_.groups.size());
-        for (auto &group_options : options) {
-            group_options.by_extra.assign(static_cast<std::size_t>(h_ + 1), nullptr);
+        for (auto &group_options : dual_options_scratch_) {
+            group_options.by_extra.fill(nullptr);
         }
 
         for (int group_index = 0; group_index < static_cast<int>(residual_blocks_.size()); group_index++) {
             const auto &group_blocks = residual_blocks_[static_cast<std::size_t>(group_index)];
             for (int extra = 1; extra < static_cast<int>(group_blocks.by_extra.size()) && extra <= h_;
                  extra++) {
-                auto &slot = options[static_cast<std::size_t>(group_index)]
+                auto &slot = dual_options_scratch_[static_cast<std::size_t>(group_index)]
                                  .by_extra[static_cast<std::size_t>(extra)];
                 if (slot != nullptr) {
                     continue;
                 }
-                for (const auto &block : group_blocks.by_extra[static_cast<std::size_t>(extra)]) {
+                for (const auto &block : residual_blocks_for_extra(group_index, extra)) {
                     if (annihilates(y, block)) {
                         slot = &block;
                         break;
@@ -1544,28 +2365,28 @@ private:
             }
         }
 
-        return options;
+        return dual_options_scratch_.data();
     }
 
     bool check_streaming_dual_from_coefficients(const std::vector<uint8_t> &basis, int dim,
                                                 const std::vector<uint8_t> &coefficients)
     {
-        std::vector<uint8_t> y = dual_from_coefficients(basis, dim, coefficients);
-        std::string key = canonical_dual_key(y);
-        if (key.empty()) {
+        dual_from_coefficients_into(basis, dim, coefficients, &dual_y_scratch_);
+        uint32_t key = 0;
+        if (!canonical_dual_key_packed(dual_y_scratch_, &key)) {
             return true;
         }
-        if (checked_streaming_dual_vectors_.find(key) != checked_streaming_dual_vectors_.end()) {
+        if (checked_streaming_dual_keys_.find(key) != checked_streaming_dual_keys_.end()) {
             return true;
         }
         if (streaming_dual_limit_ != 0 &&
-            checked_streaming_dual_vectors_.size() >= streaming_dual_limit_) {
+            checked_streaming_dual_keys_.size() >= streaming_dual_limit_) {
             streaming_dual_limit_hit_ = true;
             return false;
         }
 
-        checked_streaming_dual_vectors_.insert(key);
-        return check_dual_options(y, dual_options_for_vector(y));
+        checked_streaming_dual_keys_.insert(key);
+        return check_dual_options(dual_y_scratch_, dual_options_for_vector(dual_y_scratch_));
     }
 
     bool enumerate_streaming_annihilator_suffix(const std::vector<uint8_t> &basis, int dim, int pos,
@@ -1589,17 +2410,18 @@ private:
 
     bool stream_annihilator_projective_vectors(const ResidualBlock &block)
     {
-        std::vector<uint8_t> basis = left_nullspace_basis(block);
-        int dim = h_ == 0 ? 0 : static_cast<int>(basis.size()) / h_;
+        left_nullspace_basis_into(block, &dual_basis_scratch_);
+        int dim = h_ == 0 ? 0 : static_cast<int>(dual_basis_scratch_.size()) / h_;
         if (dim == 0) {
             return true;
         }
 
-        std::vector<uint8_t> coefficients(static_cast<std::size_t>(dim), 0);
+        dual_coefficients_scratch_.assign(static_cast<std::size_t>(dim), 0);
         for (int pivot = 0; pivot < dim; pivot++) {
-            std::fill(coefficients.begin(), coefficients.end(), 0);
-            coefficients[static_cast<std::size_t>(pivot)] = 1;
-            if (!enumerate_streaming_annihilator_suffix(basis, dim, pivot + 1, &coefficients)) {
+            std::fill(dual_coefficients_scratch_.begin(), dual_coefficients_scratch_.end(), 0);
+            dual_coefficients_scratch_[static_cast<std::size_t>(pivot)] = 1;
+            if (!enumerate_streaming_annihilator_suffix(dual_basis_scratch_, dim, pivot + 1,
+                                                        &dual_coefficients_scratch_)) {
                 return false;
             }
         }
@@ -1610,14 +2432,17 @@ private:
     {
         streaming_dual_limit_ = limit;
         streaming_dual_limit_hit_ = false;
-        checked_streaming_dual_vectors_.clear();
+        checked_streaming_dual_keys_.clear();
+        checked_streaming_dual_keys_.reserve(streaming_dual_key_capacity_hint(limit));
 
         for (int extra = h_; extra >= 1; extra--) {
-            for (const auto &group_blocks : residual_blocks_) {
+            for (int group_index = 0; group_index < static_cast<int>(residual_blocks_.size());
+                 group_index++) {
+                const auto &group_blocks = residual_blocks_[static_cast<std::size_t>(group_index)];
                 if (extra >= static_cast<int>(group_blocks.by_extra.size())) {
                     continue;
                 }
-                for (const auto &block : group_blocks.by_extra[static_cast<std::size_t>(extra)]) {
+                for (const auto &block : residual_blocks_for_extra(group_index, extra)) {
                     if (!stream_annihilator_projective_vectors(block)) {
                         return should_stop() || !streaming_dual_limit_hit_;
                     }
@@ -1631,22 +2456,23 @@ private:
     void add_dual_index_option(int group_index, const ResidualBlock &block, const std::vector<uint8_t> &basis,
                                int dim, const std::vector<uint8_t> &coefficients)
     {
-        std::vector<uint8_t> y = dual_from_coefficients(basis, dim, coefficients);
-        std::string key = canonical_dual_key(y);
-        if (key.empty()) {
+        dual_from_coefficients_into(basis, dim, coefficients, &dual_y_scratch_);
+        uint32_t key = 0;
+        if (!canonical_dual_key_packed(dual_y_scratch_, &key)) {
             return;
         }
 
-        auto inserted = dual_index_.emplace(std::move(key), std::vector<DualGroupOptions>{});
-        std::vector<DualGroupOptions> &options = inserted.first->second;
+        auto inserted = dual_index_.emplace(key, dual_index_options_.size());
+        std::size_t option_offset = inserted.first->second;
         if (inserted.second) {
-            options.resize(code_.groups.size());
-            for (auto &group_options : options) {
-                group_options.by_extra.assign(static_cast<std::size_t>(h_ + 1), nullptr);
-            }
+            option_offset = dual_index_options_.size();
+            inserted.first->second = option_offset;
+            dual_index_options_.insert(dual_index_options_.end(), code_.groups.size(),
+                                       DualGroupOptions{});
         }
 
-        auto &by_extra = options[static_cast<std::size_t>(group_index)].by_extra;
+        auto &by_extra =
+            dual_index_options_[option_offset + static_cast<std::size_t>(group_index)].by_extra;
         if (by_extra[static_cast<std::size_t>(block.extra)] == nullptr) {
             by_extra[static_cast<std::size_t>(block.extra)] = &block;
         }
@@ -1675,17 +2501,18 @@ private:
 
     bool index_annihilator_projective_vectors(int group_index, const ResidualBlock &block)
     {
-        std::vector<uint8_t> basis = left_nullspace_basis(block);
-        int dim = h_ == 0 ? 0 : static_cast<int>(basis.size()) / h_;
+        left_nullspace_basis_into(block, &dual_basis_scratch_);
+        int dim = h_ == 0 ? 0 : static_cast<int>(dual_basis_scratch_.size()) / h_;
         if (dim == 0) {
             return true;
         }
 
-        std::vector<uint8_t> coefficients(static_cast<std::size_t>(dim), 0);
+        dual_coefficients_scratch_.assign(static_cast<std::size_t>(dim), 0);
         for (int pivot = 0; pivot < dim; pivot++) {
-            std::fill(coefficients.begin(), coefficients.end(), 0);
-            coefficients[static_cast<std::size_t>(pivot)] = 1;
-            if (!enumerate_annihilator_suffix(basis, dim, pivot + 1, &coefficients, group_index, block)) {
+            std::fill(dual_coefficients_scratch_.begin(), dual_coefficients_scratch_.end(), 0);
+            dual_coefficients_scratch_[static_cast<std::size_t>(pivot)] = 1;
+            if (!enumerate_annihilator_suffix(dual_basis_scratch_, dim, pivot + 1,
+                                              &dual_coefficients_scratch_, group_index, block)) {
                 return false;
             }
         }
@@ -1695,11 +2522,18 @@ private:
     bool build_dual_index()
     {
         dual_index_.clear();
+        dual_index_options_.clear();
+        std::size_t capacity_hint = dual_index_capacity_hint();
+        dual_index_.reserve(capacity_hint);
+        if (capacity_hint != 0 && code_.groups.size() <=
+                                      std::numeric_limits<std::size_t>::max() / capacity_hint) {
+            dual_index_options_.reserve(capacity_hint * code_.groups.size());
+        }
         for (int group_index = 0; group_index < static_cast<int>(residual_blocks_.size()); group_index++) {
             const auto &group_blocks = residual_blocks_[static_cast<std::size_t>(group_index)];
             for (int extra = 1; extra < static_cast<int>(group_blocks.by_extra.size()) && extra <= h_;
                  extra++) {
-                for (const auto &block : group_blocks.by_extra[static_cast<std::size_t>(extra)]) {
+                for (const auto &block : residual_blocks_for_extra(group_index, extra)) {
                     if (!index_annihilator_projective_vectors(group_index, block)) {
                         return false;
                     }
@@ -1716,11 +2550,12 @@ private:
         }
 
         for (const auto &entry : dual_index_) {
-            if (checked_streaming_dual_vectors_.find(entry.first) != checked_streaming_dual_vectors_.end()) {
+            if (checked_streaming_dual_keys_.find(entry.first) != checked_streaming_dual_keys_.end()) {
                 continue;
             }
-            std::vector<uint8_t> y = dual_vector_from_key(entry.first);
-            if (!check_dual_options(y, entry.second)) {
+            dual_vector_from_key_into(entry.first, &dual_y_scratch_);
+            if (!check_dual_options(dual_y_scratch_,
+                                    &dual_index_options_[entry.second])) {
                 return false;
             }
         }
@@ -1744,12 +2579,15 @@ private:
         const auto &group_blocks = residual_blocks_[static_cast<std::size_t>(group_index)];
         int max_extra = std::min(h_ - used, static_cast<int>(group_blocks.by_extra.size()) - 1);
         for (int extra = max_extra; extra >= 1; extra--) {
-            const auto &blocks = group_blocks.by_extra[static_cast<std::size_t>(extra)];
+            ResidualBlockRange blocks = residual_blocks_for_extra(group_index, extra);
             for (const auto &block : blocks) {
                 group_erased_[static_cast<std::size_t>(group_index)] = block.erased_symbols;
-                std::vector<uint8_t> next = append_columns(current, h_, used, block.matrix, extra);
+                std::vector<uint8_t> &next =
+                    generic_matrix_scratch_[static_cast<std::size_t>(group_index + 1)];
+                append_columns_into(current, h_, used, block.matrix, extra, &next);
                 result_->patterns_checked++;
-                if (gf256_rank(next, h_, used + extra) < used + extra) {
+                if (gf256_rank_with_scratch(next, h_, used + extra, &rank_scratch_) <
+                    used + extra) {
                     mark_failure_with_erased(group_erased_, first_kept_global_rows(used + extra));
                     group_erased_[static_cast<std::size_t>(group_index)].clear();
                     return false;
@@ -1777,10 +2615,34 @@ private:
     const Code &code_;
     CheckResult *result_;
     std::vector<GroupResidualBlocks> residual_blocks_;
+    std::vector<std::vector<std::size_t>> residual_block_counts_;
     std::vector<std::vector<int>> group_erased_;
+    std::vector<std::vector<int>> group_symbols_;
+    std::vector<int> combination_scratch_;
+    std::vector<uint8_t> local_scratch_;
+    std::vector<uint8_t> projected_scratch_;
+    std::vector<uint8_t> joined_scratch_;
+    std::vector<uint8_t> rank_scratch_;
+    ResidualBuildScratch residual_build_scratch_;
     std::set<std::string> verified_states_;
-    std::unordered_map<std::string, std::vector<DualGroupOptions>> dual_index_;
-    std::unordered_set<std::string> checked_streaming_dual_vectors_;
+    ankerl::unordered_dense::map<uint32_t, std::pair<int, const ResidualBlock *>> h2_seen_lines_;
+    ankerl::unordered_dense::map<uint32_t, std::size_t> dual_index_;
+    std::vector<DualGroupOptions> dual_index_options_;
+    ankerl::unordered_dense::set<uint32_t> checked_streaming_dual_keys_;
+    std::vector<uint8_t> dual_reachable_;
+    std::vector<uint8_t> dual_next_;
+    std::vector<std::vector<DualParent>> dual_parents_;
+    std::vector<DualGroupOptions> dual_options_scratch_;
+    std::vector<uint8_t> dual_transposed_scratch_;
+    std::vector<uint8_t> dual_basis_scratch_;
+    std::vector<uint8_t> dual_coefficients_scratch_;
+    std::vector<uint8_t> dual_y_scratch_;
+    std::vector<uint8_t> dual_is_pivot_scratch_;
+    std::vector<int> dual_free_columns_scratch_;
+    RrefScratch dual_rref_scratch_;
+    std::vector<uint8_t> generic_empty_matrix_;
+    std::vector<std::vector<uint8_t>> generic_matrix_scratch_;
+    std::vector<int> global_completion_rows_scratch_;
     uint64_t streaming_dual_limit_ = 0;
     bool streaming_dual_limit_hit_ = false;
     int h_ = 0;
@@ -2215,9 +3077,13 @@ public:
           keep_global_mask_(static_cast<std::size_t>(code.global_parity), 0),
           group_order_(code.groups.size())
     {
+        const ScratchCapacityHint scratch_hint = scratch_capacity_hint(code_);
         targeted_blocks_.assign(code_.groups.size(),
                                 std::vector<std::vector<ResidualBlock>>(
                                     static_cast<std::size_t>(code_.global_parity + 1)));
+        targeted_block_counts_.assign(
+            code_.groups.size(),
+            std::vector<std::size_t>(static_cast<std::size_t>(code_.global_parity + 1), 0));
         targeted_extra_built_.assign(
             code_.groups.size(),
             std::vector<uint8_t>(static_cast<std::size_t>(code_.global_parity + 1), 0));
@@ -2254,15 +3120,26 @@ public:
         subset_scratch_.reserve(max_subset_size);
         erased_global_rows_.reserve(static_cast<std::size_t>(code_.global_parity));
         kept_global_rows_.reserve(static_cast<std::size_t>(code_.global_parity));
+        local_scratch_.reserve(scratch_hint.max_local_entries);
+        block_scratch_.reserve(scratch_hint.max_residual_entries);
+        projected_scratch_.reserve(scratch_hint.max_square_entries);
+        joined_scratch_.reserve(scratch_hint.max_square_entries);
+        joined_next_scratch_.reserve(scratch_hint.max_square_entries);
+        rank_scratch_.reserve(std::max(scratch_hint.max_square_entries,
+                                       scratch_hint.max_local_entries));
+        reserve_residual_build_scratch(&residual_build_scratch_, scratch_hint);
         for (auto &blocks : projected_blocks_) {
             blocks.reserve(static_cast<std::size_t>(kTargetedBlockLimit));
         }
         line_index_.reserve(static_cast<std::size_t>(kTargetedBlockLimit));
+        direct_h2_line_touched_.reserve(257);
 
         targeted_layout_static_ =
             all_local_parity_one_ && code_.global_parity <= 4 && !plan_.erasure_choices.empty();
         if (targeted_layout_static_) {
             initialize_static_targeted_layout();
+        } else {
+            preallocate_reusable_targeted_blocks();
         }
     }
 
@@ -2279,9 +3156,9 @@ public:
         }
         kept_global_rows_.clear();
         if (!targeted_layout_static_) {
-            for (auto &by_extra : targeted_blocks_) {
-                for (auto &blocks : by_extra) {
-                    blocks.clear();
+            for (auto &by_extra : targeted_block_counts_) {
+                for (auto &count : by_extra) {
+                    count = 0;
                 }
             }
         }
@@ -2334,6 +3211,11 @@ private:
     template <typename Selected>
     void mark_probe_failure_range(const Selected &selected, const std::vector<int> &kept_rows)
     {
+        result_->failures = 1;
+        if (!capture_failure_) {
+            return;
+        }
+
         std::fill(erased_.begin(), erased_.end(), 0);
 
         for (int group_index = 0; group_index < static_cast<int>(code_.groups.size()); group_index++) {
@@ -2363,10 +3245,7 @@ private:
             }
         }
 
-        result_->failures = 1;
-        if (capture_failure_) {
-            result_->first_failed_erased = erased_symbols_from_mask(code_, erased_);
-        }
+        result_->first_failed_erased = erased_symbols_from_mask(code_, erased_);
     }
 
     void mark_probe_failure(std::initializer_list<std::pair<int, const ResidualBlock *>> selected,
@@ -2378,6 +3257,11 @@ private:
     void mark_probe_failure(const ProbeSelection &selected, int selected_count,
                             const std::vector<int> &kept_rows)
     {
+        result_->failures = 1;
+        if (!capture_failure_) {
+            return;
+        }
+
         std::fill(erased_.begin(), erased_.end(), 0);
 
         for (int group_index = 0; group_index < static_cast<int>(code_.groups.size()); group_index++) {
@@ -2408,10 +3292,7 @@ private:
             }
         }
 
-        result_->failures = 1;
-        if (capture_failure_) {
-            result_->first_failed_erased = erased_symbols_from_mask(code_, erased_);
-        }
+        result_->first_failed_erased = erased_symbols_from_mask(code_, erased_);
     }
 
     struct ProjectedProbeBlock {
@@ -2419,6 +3300,16 @@ private:
         std::array<uint8_t, 16> matrix{};
         int rows = 0;
         int cols = 0;
+    };
+
+    struct ResidualBlockRange {
+        const ResidualBlock *data = nullptr;
+        std::size_t count = 0;
+
+        const ResidualBlock *begin() const { return data; }
+        const ResidualBlock *end() const { return count == 0 ? data : data + count; }
+        std::size_t size() const { return count; }
+        bool empty() const { return count == 0; }
     };
 
     bool project_block_for_probe_small(int group_index, const ResidualBlock &block,
@@ -2482,6 +3373,99 @@ private:
             projected->push_back(matrix);
         }
         return !should_stop();
+    }
+
+    bool residual_line_key_a1(int group_index, const std::vector<int> &erased_symbols,
+                              const std::vector<int> &kept_rows, uint32_t *key) const
+    {
+        if (key == nullptr || erased_symbols.size() != 2 || kept_rows.empty() ||
+            kept_rows.size() > 4) {
+            return false;
+        }
+
+        int pivot = erased_symbols[0];
+        int symbol = erased_symbols[1];
+        uint8_t pivot_local = local_erasure_coefficient(code_, group_index, pivot);
+        uint8_t symbol_local = local_erasure_coefficient(code_, group_index, symbol);
+        std::array<uint8_t, 4> values{};
+        int pivot_row = -1;
+        for (int row = 0; row < static_cast<int>(kept_rows.size()); row++) {
+            int global = kept_rows[static_cast<std::size_t>(row)];
+            uint8_t value =
+                gf256_mul(global_erasure_coefficient(code_, global, symbol), pivot_local) ^
+                gf256_mul(symbol_local, global_erasure_coefficient(code_, global, pivot));
+            values[static_cast<std::size_t>(row)] = value;
+            if (pivot_row < 0 && value != 0) {
+                pivot_row = row;
+            }
+        }
+        if (pivot_row < 0) {
+            return false;
+        }
+
+        uint8_t inv_pivot = gf256_inv(values[static_cast<std::size_t>(pivot_row)]);
+        uint32_t packed = 0;
+        for (int row = 0; row < static_cast<int>(kept_rows.size()); row++) {
+            uint8_t value = gf256_mul(values[static_cast<std::size_t>(row)], inv_pivot);
+            packed |= static_cast<uint32_t>(value) << (8U * static_cast<unsigned int>(row));
+        }
+        *key = packed;
+        return true;
+    }
+
+    static int h2_projective_slot(uint32_t key)
+    {
+        uint8_t row0 = static_cast<uint8_t>(key & 0xffU);
+        uint8_t row1 = static_cast<uint8_t>((key >> 8U) & 0xffU);
+        if (row0 == 1) {
+            return row1;
+        }
+        if (row0 == 0 && row1 == 1) {
+            return 256;
+        }
+        return -1;
+    }
+
+    bool record_direct_single_failure(int group_index, const std::vector<int> &erased_symbols,
+                                      const std::vector<int> &kept_rows)
+    {
+        result_->patterns_checked++;
+        if (!capture_failure_) {
+            result_->failures = 1;
+            return true;
+        }
+
+        direct_failure_blocks_[0].extra =
+            static_cast<int>(erased_symbols.size()) -
+            code_.groups[static_cast<std::size_t>(group_index)].local_parity;
+        direct_failure_blocks_[0].erased_symbols.assign(erased_symbols.begin(),
+                                                        erased_symbols.end());
+        mark_probe_failure({{group_index, &direct_failure_blocks_[0]}}, kept_rows);
+        return true;
+    }
+
+    bool record_direct_pair_failure(int left_group, const std::vector<int> &left_erased,
+                                    int right_group, const std::vector<int> &right_erased,
+                                    const std::vector<int> &kept_rows)
+    {
+        result_->patterns_checked++;
+        if (!capture_failure_) {
+            result_->failures = 1;
+            return true;
+        }
+
+        direct_failure_blocks_[0].extra =
+            static_cast<int>(left_erased.size()) -
+            code_.groups[static_cast<std::size_t>(left_group)].local_parity;
+        direct_failure_blocks_[0].erased_symbols.assign(left_erased.begin(), left_erased.end());
+        direct_failure_blocks_[1].extra =
+            static_cast<int>(right_erased.size()) -
+            code_.groups[static_cast<std::size_t>(right_group)].local_parity;
+        direct_failure_blocks_[1].erased_symbols.assign(right_erased.begin(), right_erased.end());
+        mark_probe_failure({{left_group, &direct_failure_blocks_[0]},
+                            {right_group, &direct_failure_blocks_[1]}},
+                           kept_rows);
+        return true;
     }
 
     bool confirm_projected_pair(int left_group, const ProjectedProbeBlock &left,
@@ -2614,20 +3598,22 @@ private:
         return true;
     }
 
-    const std::vector<ResidualBlock> &probe_blocks(int group, int extra)
+    ResidualBlockRange probe_blocks(int group, int extra)
     {
-        static const std::vector<ResidualBlock> empty;
         if (!build_targeted_blocks(group, extra)) {
-            return empty;
+            return {};
         }
         if (group < 0 || group >= static_cast<int>(targeted_blocks_.size())) {
-            return empty;
+            return {};
         }
         const auto &by_extra = targeted_blocks_[static_cast<std::size_t>(group)];
         if (extra < 0 || extra >= static_cast<int>(by_extra.size())) {
-            return empty;
+            return {};
         }
-        return by_extra[static_cast<std::size_t>(extra)];
+        const auto &blocks = by_extra[static_cast<std::size_t>(extra)];
+        std::size_t count =
+            targeted_block_counts_[static_cast<std::size_t>(group)][static_cast<std::size_t>(extra)];
+        return {blocks.empty() ? nullptr : blocks.data(), std::min(count, blocks.size())};
     }
 
     bool execute_single_rank_probe(const StressProbe &probe)
@@ -2653,6 +3639,15 @@ private:
     {
         int left_group = probe.groups[0];
         int right_group = probe.groups[1];
+        bool handled_by_fast_path = false;
+        if (execute_line_collision_probe_a1_h2(probe, left_group, right_group,
+                                               &handled_by_fast_path)) {
+            return true;
+        }
+        if (handled_by_fast_path) {
+            return false;
+        }
+
         uint64_t scanned = 0;
         auto &left_blocks = projected_blocks_[0];
         auto &right_blocks = projected_blocks_[1];
@@ -2681,6 +3676,73 @@ private:
             if (found != line_index_.end()) {
                 return confirm_projected_pair(left_group, *found->second, right_group, right,
                                               probe.kept_rows);
+            }
+        }
+        return false;
+    }
+
+    bool execute_line_collision_probe_a1_h2(const StressProbe &probe, int left_group,
+                                            int right_group, bool *handled)
+    {
+        if (handled == nullptr) {
+            return false;
+        }
+        *handled = false;
+        if (code_.global_parity != 2 || probe.terms != 2 || probe.extras[0] != 1 ||
+            probe.extras[1] != 1 || probe.kept_rows.size() != 2) {
+            return false;
+        }
+        if (left_group < 0 || right_group < 0 ||
+            left_group >= static_cast<int>(code_.groups.size()) ||
+            right_group >= static_cast<int>(code_.groups.size())) {
+            return false;
+        }
+        if (code_.groups[static_cast<std::size_t>(left_group)].local_parity != 1 ||
+            code_.groups[static_cast<std::size_t>(right_group)].local_parity != 1) {
+            return false;
+        }
+        *handled = true;
+
+        const auto &left_choices = plan_.erasure_choices[static_cast<std::size_t>(left_group)][1];
+        const auto &right_choices = plan_.erasure_choices[static_cast<std::size_t>(right_group)][1];
+        uint64_t scanned = 0;
+        for (int slot : direct_h2_line_touched_) {
+            direct_h2_line_index_[static_cast<std::size_t>(slot)] = nullptr;
+        }
+        direct_h2_line_touched_.clear();
+        for (const auto &erased_symbols : left_choices) {
+            if (scanned >= probe.scan_limit) {
+                break;
+            }
+            scanned++;
+            uint32_t key = 0;
+            if (!residual_line_key_a1(left_group, erased_symbols, probe.kept_rows, &key)) {
+                return record_direct_single_failure(left_group, erased_symbols, probe.kept_rows);
+            }
+            int slot = h2_projective_slot(key);
+            if (slot >= 0 && direct_h2_line_index_[static_cast<std::size_t>(slot)] == nullptr) {
+                direct_h2_line_index_[static_cast<std::size_t>(slot)] = &erased_symbols;
+                direct_h2_line_touched_.push_back(slot);
+            }
+        }
+
+        for (const auto &erased_symbols : right_choices) {
+            if (scanned >= probe.scan_limit) {
+                break;
+            }
+            scanned++;
+            uint32_t key = 0;
+            if (!residual_line_key_a1(right_group, erased_symbols, probe.kept_rows, &key)) {
+                return record_direct_single_failure(right_group, erased_symbols, probe.kept_rows);
+            }
+            int slot = h2_projective_slot(key);
+            if (slot >= 0) {
+                const std::vector<int> *left_erased =
+                    direct_h2_line_index_[static_cast<std::size_t>(slot)];
+                if (left_erased != nullptr) {
+                    return record_direct_pair_failure(left_group, *left_erased, right_group,
+                                                      erased_symbols, probe.kept_rows);
+                }
             }
         }
         return false;
@@ -3092,8 +4154,72 @@ private:
                     block.has_small_matrix = true;
                     blocks.push_back(std::move(block));
                 }
+                targeted_block_counts_[static_cast<std::size_t>(group_index)]
+                                      [static_cast<std::size_t>(extra)] = blocks.size();
             }
         }
+    }
+
+    bool has_targeted_probe() const
+    {
+        for (const auto &probe : plan_.probes) {
+            if (probe.kind != StressProbeKind::RandomResidual) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void preallocate_reusable_targeted_blocks()
+    {
+        if (!has_targeted_probe()) {
+            return;
+        }
+
+        for (int group_index = 0; group_index < static_cast<int>(code_.groups.size()); group_index++) {
+            const auto &group = code_.groups[static_cast<std::size_t>(group_index)];
+            for (int extra = 1; extra <= code_.global_parity; extra++) {
+                const auto &choices =
+                    plan_.erasure_choices[static_cast<std::size_t>(group_index)]
+                                         [static_cast<std::size_t>(extra)];
+                if (choices.empty() || choices.size() > kTargetedBlockLimit) {
+                    continue;
+                }
+
+                auto &blocks = targeted_blocks_[static_cast<std::size_t>(group_index)]
+                                              [static_cast<std::size_t>(extra)];
+                blocks.resize(choices.size());
+                std::size_t erased_capacity =
+                    static_cast<std::size_t>(group.local_parity + extra);
+                std::size_t matrix_capacity =
+                    static_cast<std::size_t>(code_.global_parity) * static_cast<std::size_t>(extra);
+                for (auto &block : blocks) {
+                    block.erased_symbols.reserve(erased_capacity);
+                    block.matrix.reserve(matrix_capacity);
+                }
+            }
+        }
+    }
+
+    ResidualBlock &next_targeted_block(int group_index, int extra)
+    {
+        auto &blocks = targeted_blocks_[static_cast<std::size_t>(group_index)]
+                                      [static_cast<std::size_t>(extra)];
+        auto &count = targeted_block_counts_[static_cast<std::size_t>(group_index)]
+                                            [static_cast<std::size_t>(extra)];
+        if (count >= blocks.size()) {
+            blocks.emplace_back();
+        }
+
+        ResidualBlock &block = blocks[count++];
+        block.extra = extra;
+        block.erased_symbols.clear();
+        block.matrix.clear();
+        block.small_matrix.fill(0);
+        block.small_rows = 0;
+        block.small_cols = 0;
+        block.has_small_matrix = false;
+        return block;
     }
 
     bool initialize_targeted_storage()
@@ -3114,13 +4240,18 @@ private:
             }
 
             const auto &choices = plan_.erasure_choices[static_cast<std::size_t>(group_index)][0];
-            for (const auto &erased_symbols : choices) {
-                std::vector<uint8_t> local =
-                    build_local_erasure_submatrix(code_, group_index, erased_symbols);
-                if (gf256_rank(local, group.local_parity,
-                               static_cast<int>(erased_symbols.size())) == group.local_parity) {
-                    baseline_erased_[static_cast<std::size_t>(group_index)] = erased_symbols;
-                    break;
+            if (code_.local_mds_guaranteed && !choices.empty()) {
+                baseline_erased_[static_cast<std::size_t>(group_index)] = choices.front();
+            } else {
+                for (const auto &erased_symbols : choices) {
+                    build_local_erasure_submatrix_into(code_, group_index, erased_symbols,
+                                                       &local_scratch_);
+                    if (gf256_rank_destructive(&local_scratch_, group.local_parity,
+                                               static_cast<int>(erased_symbols.size())) ==
+                        group.local_parity) {
+                        baseline_erased_[static_cast<std::size_t>(group_index)] = erased_symbols;
+                        break;
+                    }
                 }
             }
             if (baseline_erased_[static_cast<std::size_t>(group_index)].empty()) {
@@ -3164,11 +4295,11 @@ private:
         }
         auto &blocks = targeted_blocks_[static_cast<std::size_t>(group_index)]
                                       [static_cast<std::size_t>(extra)];
-        if (!targeted_layout_static_) {
+        if (!targeted_layout_static_ && blocks.capacity() < choices.size()) {
             blocks.reserve(choices.size());
         }
-        bool local_rank_is_automatic = group.local_parity == 1;
-        bool use_small_matrix = local_rank_is_automatic && code_.global_parity <= 4 && extra <= 4;
+        bool local_rank_is_automatic = code_.local_mds_guaranteed || group.local_parity == 1;
+        bool use_small_matrix = group.local_parity == 1 && code_.global_parity <= 4 && extra <= 4;
         if (targeted_layout_static_) {
             for (auto &block : blocks) {
                 build_residual_erasure_block_a1_small(code_, group_index, block.erased_symbols,
@@ -3178,23 +4309,18 @@ private:
         }
 
         for (const auto &erased_symbols : choices) {
+            ResidualBlock &block = next_targeted_block(group_index, extra);
+            block.erased_symbols.assign(erased_symbols.begin(), erased_symbols.end());
             if (!local_rank_is_automatic) {
-                std::vector<uint8_t> local =
-                    build_local_erasure_submatrix(code_, group_index, erased_symbols);
-                if (gf256_rank(local, group.local_parity,
-                               static_cast<int>(erased_symbols.size())) <
+                build_local_erasure_submatrix_into(code_, group_index, erased_symbols,
+                                                   &local_scratch_);
+                if (gf256_rank_destructive(&local_scratch_, group.local_parity,
+                                           static_cast<int>(erased_symbols.size())) <
                     group.local_parity) {
-                    ResidualBlock block;
-                    block.extra = extra;
-                    block.erased_symbols = erased_symbols;
-                    blocks.push_back(std::move(block));
                     continue;
                 }
             }
 
-            ResidualBlock block;
-            block.extra = extra;
-            block.erased_symbols = erased_symbols;
             if (use_small_matrix) {
                 block.small_rows = code_.global_parity;
                 block.small_cols = extra;
@@ -3202,10 +4328,9 @@ private:
                 build_residual_erasure_block_a1_small(code_, group_index, erased_symbols,
                                                       extra, &block.small_matrix);
             } else {
-                block.matrix = build_residual_erasure_block(code_, group_index,
-                                                            erased_symbols, extra);
+                build_residual_erasure_block_into(code_, group_index, erased_symbols, extra,
+                                                  &block.matrix, &residual_build_scratch_);
             }
-            blocks.push_back(std::move(block));
         }
 
         return true;
@@ -3417,7 +4542,10 @@ private:
         }
 
         int residual_size = static_cast<int>(kept_global_rows_.size());
-        std::vector<uint8_t> joined;
+        std::vector<uint8_t> *joined = &joined_scratch_;
+        std::vector<uint8_t> *next_joined = &joined_next_scratch_;
+        joined->clear();
+        next_joined->clear();
         int used = 0;
 
         for (int group_index = 0; group_index < static_cast<int>(code_.groups.size()); group_index++) {
@@ -3428,33 +4556,42 @@ private:
                 return false;
             }
 
-            std::vector<uint8_t> local =
-                build_local_erasure_submatrix(code_, group_index, erased_symbols);
-            if (gf256_rank(local, group.local_parity, static_cast<int>(erased_symbols.size())) <
-                group.local_parity) {
-                return false;
+            if (!code_.local_mds_guaranteed) {
+                build_local_erasure_submatrix_into(code_, group_index, erased_symbols,
+                                                   &local_scratch_);
+                if (gf256_rank_destructive(&local_scratch_, group.local_parity,
+                                           static_cast<int>(erased_symbols.size())) <
+                    group.local_parity) {
+                    return false;
+                }
             }
             if (extra == 0) {
                 continue;
             }
 
-            std::vector<uint8_t> block =
-                build_residual_erasure_block(code_, group_index, erased_symbols, extra);
-            std::vector<uint8_t> projected =
-                project_rows(block, code_.global_parity, extra, kept_global_rows_);
-            if (gf256_rank(projected, residual_size, extra) < extra) {
+            build_residual_erasure_block_into(code_, group_index, erased_symbols, extra,
+                                              &block_scratch_, &residual_build_scratch_);
+            project_rows_into(block_scratch_, code_.global_parity, extra, kept_global_rows_,
+                              &projected_scratch_);
+            if (gf256_rank_with_scratch(projected_scratch_, residual_size, extra,
+                                        &rank_scratch_) < extra) {
                 return false;
             }
 
-            joined = append_columns(joined, residual_size, used, projected, extra);
+            append_columns_into(*joined, residual_size, used, projected_scratch_, extra,
+                                next_joined);
             used += extra;
-            if (gf256_rank(joined, residual_size, used) < used) {
+            if (gf256_rank_with_scratch(*next_joined, residual_size, used, &rank_scratch_) <
+                used) {
                 return false;
             }
+            std::swap(joined, next_joined);
         }
 
         return used == residual_size &&
-               (residual_size == 0 || gf256_rank(joined, residual_size, residual_size) == residual_size);
+               (residual_size == 0 ||
+                gf256_rank_with_scratch(*joined, residual_size, residual_size, &rank_scratch_) ==
+                    residual_size);
     }
 
     void check_current_pattern()
@@ -3490,15 +4627,53 @@ private:
     std::vector<int> group_order_;
     std::vector<int> available_groups_;
     std::vector<int> subset_scratch_;
+    std::vector<uint8_t> local_scratch_;
+    std::vector<uint8_t> block_scratch_;
+    std::vector<uint8_t> projected_scratch_;
+    std::vector<uint8_t> joined_scratch_;
+    std::vector<uint8_t> joined_next_scratch_;
+    std::vector<uint8_t> rank_scratch_;
+    ResidualBuildScratch residual_build_scratch_;
     std::array<std::vector<ProjectedProbeBlock>, 4> projected_blocks_;
     ankerl::unordered_dense::map<uint32_t, const ProjectedProbeBlock *> line_index_;
+    std::array<const std::vector<int> *, 257> direct_h2_line_index_{};
+    std::vector<int> direct_h2_line_touched_;
+    std::array<ResidualBlock, 2> direct_failure_blocks_;
     bool all_local_parity_one_ = false;
     bool targeted_layout_static_ = false;
     bool targeted_blocks_initialized_ = false;
     std::vector<std::vector<std::vector<ResidualBlock>>> targeted_blocks_;
+    std::vector<std::vector<std::size_t>> targeted_block_counts_;
     std::vector<std::vector<uint8_t>> targeted_extra_built_;
     std::vector<std::vector<int>> baseline_erased_;
 };
+
+CheckResult check_mr_with_residual_verifier(const Code &code, ResidualVerifier *verifier)
+{
+    CheckResult result;
+    verifier->run(&result);
+    if (!result.is_mr) {
+        return result;
+    }
+
+    CheckResult gate;
+    FullErasureGate full_gate(code, &gate);
+    full_gate.run();
+    result.patterns_checked += gate.patterns_checked;
+    if (!gate.is_mr) {
+        result.is_mr = false;
+        result.strict_complete = false;
+        result.failures = gate.failures;
+        result.first_failed_erased = std::move(gate.first_failed_erased);
+        result.message = "residual checker passed, but the full maximal erasure gate failed";
+        return result;
+    }
+
+    result.strict_complete = true;
+    result.message =
+        "candidate passed residual verification and the full maximal erasure gate";
+    return result;
+}
 
 } // namespace
 
@@ -3515,6 +4690,11 @@ const char *family_name(MatrixFamily family)
         return "random";
     }
     return "unknown";
+}
+
+Code make_code_layout(const Params &params)
+{
+    return make_empty_code(params);
 }
 
 bool parse_family(const std::string &name, MatrixFamily *family)
@@ -3569,30 +4749,8 @@ std::string symbol_label(const Code &code, int symbol)
 
 CheckResult check_mr(const Code &code)
 {
-    CheckResult result;
-    ResidualVerifier verifier(code, &result);
-    verifier.run();
-    if (!result.is_mr) {
-        return result;
-    }
-
-    CheckResult gate;
-    FullErasureGate full_gate(code, &gate);
-    full_gate.run();
-    result.patterns_checked += gate.patterns_checked;
-    if (!gate.is_mr) {
-        result.is_mr = false;
-        result.strict_complete = false;
-        result.failures = gate.failures;
-        result.first_failed_erased = std::move(gate.first_failed_erased);
-        result.message = "residual checker passed, but the full maximal erasure gate failed";
-        return result;
-    }
-
-    result.strict_complete = true;
-    result.message =
-        "candidate passed residual verification and the full maximal erasure gate";
-    return result;
+    ResidualVerifier verifier(code);
+    return check_mr_with_residual_verifier(code, &verifier);
 }
 
 GenerateResult generate(const Params &params)
@@ -3607,6 +4765,35 @@ GenerateResult generate(const Params &params)
             result.cauchy_dedup_key_bytes = cauchy_dedup_key_bytes(base_code);
         }
         PrefilterPlan prefilter_plan = build_prefilter_plan(base_code, params.prefilter_count);
+
+        if (params.construction != 0 && supports_difference_pack_h2(base_code)) {
+            for (uint64_t attempt = 1; attempt <= params.construction; attempt++) {
+                Code constructed = base_code;
+                constructed.attempt = attempt;
+                Rng rng(seed_for_attempt(params.seed, attempt));
+                uint64_t delta_checks = 0;
+                if (!build_difference_pack_h2_candidate(&constructed, rng, &delta_checks)) {
+                    continue;
+                }
+
+                CheckResult check;
+                check.is_mr = true;
+                check.strict_complete = true;
+                check.patterns_checked = delta_checks;
+                check.message =
+                    "candidate accepted by difference-pack h=2 construction proof";
+
+                result.status = 0;
+                result.message =
+                    "MR-LRC matrix found by difference-pack h=2 construction";
+                result.code = std::move(constructed);
+                result.check = std::move(check);
+                result.attempts_done = attempt;
+                result.unique_candidates_checked = 1;
+                result.strict_candidates_checked = 1;
+                return result;
+            }
+        }
 
         struct WorkerStats {
             uint64_t attempts_done = 0;
@@ -3778,8 +4965,30 @@ GenerateResult generate(const Params &params)
             });
         }
 
-        auto run_attempt = [&](uint64_t attempt, WorkerStats *stats, Code *code,
-                               RandomStressPrefilter *stress_prefilter) {
+        struct WorkerContext {
+            WorkerStats stats;
+            Code code;
+            ResidualVerifier residual_verifier;
+            std::optional<RandomStressPrefilter> stress_prefilter;
+
+            WorkerContext(const Code &base_code, const PrefilterPlan &prefilter_plan,
+                          bool prefilter_enabled)
+                : code(base_code), residual_verifier(code)
+            {
+                if (prefilter_enabled) {
+                    stress_prefilter.emplace(code, prefilter_plan);
+                }
+            }
+
+            RandomStressPrefilter *prefilter()
+            {
+                return stress_prefilter ? &*stress_prefilter : nullptr;
+            }
+        };
+
+        auto run_attempt = [&](uint64_t attempt, WorkerContext *context) {
+            WorkerStats *stats = &context->stats;
+            Code *code = &context->code;
             code->attempt = attempt;
             uint64_t attempt_seed = seed_for_attempt(params.seed, attempt);
             Rng rng(attempt_seed);
@@ -3804,8 +5013,8 @@ GenerateResult generate(const Params &params)
                     splitmix64_value(attempt_seed ^ UINT64_C(0xa4d1f3c9b27e596d)));
                 bool capture_prefilter_failure =
                     !first_failure_recorded.load(std::memory_order_relaxed);
-                stress_prefilter->reset(prefilter_rng, &prefilter, capture_prefilter_failure);
-                stress_prefilter->run();
+                context->prefilter()->reset(prefilter_rng, &prefilter, capture_prefilter_failure);
+                context->prefilter()->run();
                 candidate_prefilter_patterns = prefilter.patterns_checked;
                 stats->prefilter_candidates++;
                 stats->prefilter_patterns_checked += candidate_prefilter_patterns;
@@ -3828,7 +5037,7 @@ GenerateResult generate(const Params &params)
                 }
             }
 
-            CheckResult check = check_mr(*code);
+            CheckResult check = check_mr_with_residual_verifier(*code, &context->residual_verifier);
             check.patterns_checked += candidate_prefilter_patterns;
             stats->total_patterns_checked += check.patterns_checked;
             if (check.strict_complete) {
@@ -3865,27 +5074,21 @@ GenerateResult generate(const Params &params)
 
         for (uint64_t worker = 0; worker < worker_count; worker++) {
             workers.emplace_back([&, worker]() {
-                WorkerStats local_stats;
-                Code worker_code = base_code;
-                std::unique_ptr<RandomStressPrefilter> stress_prefilter;
-                if (params.prefilter_count != 0) {
-                    stress_prefilter =
-                        std::make_unique<RandomStressPrefilter>(worker_code, prefilter_plan);
-                }
+                WorkerContext context(base_code, prefilter_plan, params.prefilter_count != 0);
                 uint64_t attempts_since_publish = 0;
                 auto publish_local_stats = [&]() {
-                    publish_stats(static_cast<std::size_t>(worker), local_stats);
+                    publish_stats(static_cast<std::size_t>(worker), context.stats);
                 };
                 auto finish_local_stats = [&]() {
                     publish_local_stats();
-                    final_worker_stats[static_cast<std::size_t>(worker)] = local_stats;
+                    final_worker_stats[static_cast<std::size_t>(worker)] = context.stats;
                 };
                 try {
                     for (uint64_t attempt = worker + 1; attempt <= params.random_limit;) {
                         if (stop.load(std::memory_order_relaxed)) {
                             break;
                         }
-                        run_attempt(attempt, &local_stats, &worker_code, stress_prefilter.get());
+                        run_attempt(attempt, &context);
                         attempts_since_publish++;
                         if (attempts_since_publish >= kStatsPublishInterval) {
                             publish_local_stats();
